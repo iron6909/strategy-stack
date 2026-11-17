@@ -11,9 +11,9 @@
 - [ ] **Step 3: 本地 Ubuntu 工作树清理 (`Clean Stale Worktrees`)**
   通过 Tailscale 检查本地 Ubuntu `~/work/worktrees/` 下对应 Linear 已 `Done` 超过 7 天的遗留工作树并安全清理释放 SSD 空间。
 - [ ] **Step 4: 清理收尾 (`Quiet Termination`)**
-  Step 1–3 由韩非执行。仅在归档了异常僵尸工单、发现超限成员（转交鬼谷交接）或清理了工作树时向 Sirus 发送简报；若无异常，安静结束回合。
+  Step 1–5 均由韩非执行。Step 1–3 仅在归档了异常僵尸工单、发现超限成员（转交鬼谷交接）或清理了工作树时向 Sirus 发送简报；若无异常，安静结束回合。
 - [ ] **Step 5: Strategy-Stack 仓库进化审计 (`Evolve Strategy-Stack`)**
-  由鬼谷执行，独立于 Step 1–4：
+  由韩非执行，独立于 Step 1–4 的结果：
   1. 扫描本周【墨翟 1世】与【张仪 1世】的卡壳记录与返工原因（Linear `Blocked` 工单、二败回滚、`--resume` 返工、Sirus 的纠正）。
   2. 若发现某条剧本步骤冗余或缺失边界检查，拟定针对 `~/strategy-stack` 的具体文件修改方案，附修改前后的 Diff 对比，以 `Needs me` 状态报给 Sirus；**获批后**才执行 `git commit` 与 `git push`。
   3. 核查 `cloud/playbooks/` 与 `local/skills/` 中是否有连续两周未被触发的冗余文件，提议归档删除，同样以 `Needs me` 报给 Sirus，获批后才动手。
