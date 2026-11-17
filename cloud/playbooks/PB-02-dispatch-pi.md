@@ -27,4 +27,4 @@
   - **若连续 2 次同一假设失败**：确认本地工作区已回滚，将 Linear 工单状态挂为 **`Blocked`**，以 `Blocked` 状态报给 Sirus。
 
 - [ ] **Step 4: 解锁下游依赖工单 (`Unblock Dependent Tickets`)**
-  当Sirus 批准合并当前工单后，检查 Linear 中被当前工单 `Blocking` 的后续子工单，若其所有前置依赖均已清零，将其状态从 `Blocked` 切换为 `Queued`。
+  当 Sirus 批准合并当前工单后，检查 Linear 中被当前工单 `Blocking` 的后续子工单，若其所有前置依赖均已清零，将其状态从 `Blocked` 切换为 `Queued`。

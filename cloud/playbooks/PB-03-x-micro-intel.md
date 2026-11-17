@@ -1,12 +1,12 @@
 # 剧本 PB-03：按需 X 情报侦察与 1–12 字中文短语草稿 (X Micro-Intel & Drafts)
 
-> **适用场景**：仅在Sirus 点名召唤时触发（无任何自动写推定时任务）。
+> **适用场景**：仅在 Sirus 点名召唤时触发（无任何自动写推定时任务）。
 > **核心铁律**：开工前必须将以下 Steps 1–4 **一字不差地原样复制**到你的执行 Todo 列表中逐项推进。
 
 ## 标准作业步骤 (Verbatim Todo Steps)
 
 - [ ] **Step 1: 读取 Linear 配置、靶标库与工部近期战果 (`Read Config, Watchlist & Mozi Progress`)**
-  1. 读取 `~/court/linear_config.json` 与 `~/court/intel/x-watchlist-and-voice.md`（若尚未聚类Sirus 的关注列表，先读取 `Following` 归纳前三类靶标）。
+  1. 读取 `~/court/linear_config.json` 与 `~/court/intel/x-watchlist-and-voice.md`（若尚未聚类 Sirus 的关注列表，先读取 `Following` 归纳前三类靶标）。
   2. 查询 Linear 工部（`teams.mozi_eng.team_id`）近 48 小时进入 `Needs Approval` 或 `Done` 的工单，提取可公开分享的真实踩坑与指标。
 
 - [ ] **Step 2: 抓取三类靶标高信噪比动态 (`Scan Top-3 Clusters`)**
