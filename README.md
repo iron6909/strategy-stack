@@ -15,9 +15,11 @@
   - Tailscale 派单本地 Pi 与结果呈报 → `cloud/playbooks/PB-02-dispatch-pi.md`
   - 按需 X 情报聚类与 1–12 字短语草稿 → `cloud/playbooks/PB-03-x-micro-intel.md`
   - 每周垃圾回收、Linear 旧单归档与仓库进化审计 → `cloud/playbooks/PB-04-weekly-gc.md`
+  - MyMontage 视频创作与 Google Drive 分类归档 → `cloud/playbooks/PB-05-video-montage.md`
   - 120K Token 触发 `N世` 转世交接 → `cloud/skills/reincarnation.md`
   - 1–12 字中文短语与去 AI 味过滤 → `cloud/skills/unslop-cn.md`
 - **本地内环（Ubuntu Pi）**：
   - 垂直切片 TDD 实现 → `local/skills/implement-tdd.md`
   - 五步真实验证与二败回滚 → `local/skills/prove-it-works.md`
   - 本地 Gemini Pro (`agy -p`) 双轴只读审查 → `local/skills/local-cross-audit.md`
+  - 本地 MyMontage 视频调度、验片与 rclone 直传 Google Drive → `local/scripts/run-video-worker.sh`
