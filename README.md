@@ -30,7 +30,7 @@
 > 本门禁只适用于代码工程（PB-02 / `local/scripts/run-worker.sh`）。视频创作走 PB-05 / `local/scripts/run-video-worker.sh`：由本地 `agy` 驱动 OpenMontage 五层流水线，用内置质量门禁 + `ffprobe` 校验物理流，经 `rclone` 按领域或 `99_Temp_Test` 直传 Google Drive；**上传成功后工单直接标 `Done`**，不挂 `Needs Approval`，也不做 git 合入。
 
 1. `PI_EXIT == 0`：实施用 `pi --mode json ... < /dev/null` 正常退出，且改动已提交到 `feat/<工单号>`（留下未提交改动直接判 FAIL）。
-2. `AUDIT_VERDICT == PASS`：审查用 `agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m -p ... < /dev/null`，prompt 首句硬禁 bash/shell/文件工具，只喂 `.task/review-bundle.txt` 纯文本（任务书 + `.task/evidence/` 文本证据 + 文件清单 + 绑定已审 commit 的 `git diff`），报告首行必须恰为 `VERDICT: PASS`。
+2. `AUDIT_VERDICT == PASS`：审查用 `agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m --input-format text < .task/audit-prompt.txt` 从 stdin 读到 EOF，prompt（首句硬禁 bash/shell/文件工具）+ `.task/review-bundle.txt` 全文（任务书 + `.task/evidence/` 文本证据 + 文件清单 + 绑定已审 commit 的 `git diff`）都走文件，绝不进 argv（单参数上限约 128KiB），报告首行必须恰为 `VERDICT: PASS`。
 3. 两条同时成立才 `git merge --no-ff` 合入 `$BASE_BRANCH`，随后 `git push`（不 `--force`）。
 4. `auto_merged == 1` 必须同时满足：merge 成功、push 成功、且已 `git fetch` + `git merge-base --is-ancestor` 核实远端分支包含该 merge commit。缺一即 `AUTO_MERGED=0`（并发锁、基线变化、脏仓库、冲突、推送拒绝都走这条路）。
 5. 失败一律写证据到 `.task/<工单号>-merge.txt` 与 `.task/webhook-payload.json`，worktree 保留；脚本从不 `--force` 删除工作树，证据先归档到 `~/task-archive/<工单号>/`。
