@@ -82,7 +82,7 @@ resolve_git_common_dir() {
   printf '%s\n' "$common"
 }
 
-# .task/ out/ projects/ 是脚本自产目录：写进主仓 info/exclude，重复调用不得产生重复行。
+# .task/ out/ projects/ .pi/ 是脚本/运行时自产目录：写进主仓 info/exclude，重复调用不得产生重复行。
 # exclude 只挡未跟踪文件，已 tracked 的 .task 只能靠 tree 检查，不能拿 ignore 当清除手段。
 ensure_common_excludes() {
   local common="${1:-}" exclude entry
@@ -92,7 +92,7 @@ ensure_common_excludes() {
   if [[ -s "$exclude" && -n "$(tail -c 1 "$exclude")" ]]; then
     printf '\n' >> "$exclude" || return 1   # 原文件末尾无换行时先补齐，避免粘连出错误规则
   fi
-  for entry in '.task/' 'out/' 'projects/'; do
+  for entry in '.task/' 'out/' 'projects/' '.pi/'; do
     if grep -qxF -- "$entry" "$exclude" 2>/dev/null; then
       continue
     fi
@@ -152,18 +152,19 @@ MERGE_REASON="not_attempted"
 # 工具函数
 # ---------------------------------------------------------------------------
 
-# 工作区指纹：HEAD + 受版本控制的改动 + 未跟踪文件清单（.task/ 为脚本自产，排除）
+# 工作区指纹：HEAD + 受版本控制的改动 + 未跟踪文件清单
+# .task/ 与 .pi/ 为脚本/运行时自产，排除；这里不依赖 info/exclude，规则缺失时也能自兜
 # shortcut: 未跟踪文件只比对文件名不比对内容，出现「审查后改写未跟踪文件」时升级
 worktree_state() {
   {
     git -C "$WORKTREE_DIR" rev-parse HEAD
-    git -C "$WORKTREE_DIR" status --porcelain -uall | grep -v '^?? \.task/' || true
+    git -C "$WORKTREE_DIR" status --porcelain -uall | grep -vE '^\?\? \.(task|pi)/' || true
     git -C "$WORKTREE_DIR" diff HEAD
   } | sha256sum | cut -d' ' -f1
 }
 
 worktree_dirty() {
-  [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain -uall | grep -v '^?? \.task/' || true)" ]]
+  [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain -uall | grep -vE '^\?\? \.(task|pi)/' || true)" ]]
 }
 
 # 审查前失败出口：写明确 reason（无空格，直接进 webhook JSON），由调用方决定不进审查

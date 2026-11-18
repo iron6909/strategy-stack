@@ -46,6 +46,18 @@ case "${STUB_PI:-ok}" in
   fail)  exit 7 ;;
   dirty) echo dirty >> ./f.txt; exit 0 ;;
   none)  exit 0 ;;
+  piartifacts|piartifacts_noexclude)
+    # pi 运行时在 worktree 留下未跟踪的 .pi/（不得入库，也不得被判成脏树）
+    mkdir -p .pi/tasks
+    echo "harness log for ${STUB_PI}" > .pi/tasks/run.log
+    if [[ "${STUB_PI}" == "piartifacts_noexclude" ]]; then
+      # 模拟 info/exclude 里沒有 .pi/ 的情况：过滤逻辑必须自己兜住
+      excl="$(git rev-parse --git-common-dir)/info/exclude"
+      tmp="$(mktemp)"
+      grep -vxF '.pi/' "$excl" > "$tmp"
+      cat "$tmp" > "$excl"
+      rm -f "$tmp"
+    fi ;;
 esac
 mkdir -p .task/evidence
 echo "proof line for ${STUB_PI:-ok}" > .task/evidence/proof.txt
@@ -352,6 +364,7 @@ exists "主仓 info/exclude 被写入" "$HOST_EXCLUDE"
 eq ".task/ 已写入主仓 exclude" "$(grep -cxF '.task/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
 eq "out/ 已写入主仓 exclude" "$(grep -cxF 'out/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
 eq "projects/ 已写入主仓 exclude" "$(grep -cxF 'projects/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
+eq ".pi/ 已写入主仓 exclude" "$(grep -cxF '.pi/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
 exists "worktree 已建立" "$ROOT/worktrees/worktrees/$TICKET"
 
 # ---------------------------------------------------------------------------
@@ -429,6 +442,35 @@ EXCLUDE="$REPO/.git/info/exclude"
 eq ".task/ 重复执行不重复写行" "$(grep -cxF '.task/' "$EXCLUDE")" "1"
 eq "out/ 重复执行不重复写行" "$(grep -cxF 'out/' "$EXCLUDE")" "1"
 eq "projects/ 重复执行不重复写行" "$(grep -cxF 'projects/' "$EXCLUDE")" "1"
+eq ".pi/ 重复执行不重复写行" "$(grep -cxF '.pi/' "$EXCLUDE")" "1"
+
+# ---------------------------------------------------------------------------
+CASE="untracked_pi_not_dirty"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=piartifacts STUB_AGY=pass
+run_worker
+eq "审查未被 .pi/ 误判" "$(done_field audit)" "PASS"
+eq "audit reason" "$(done_field audit_reason)" "ok"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+AUDITED="$(payload_field audited_commit)"
+is_true "待审 tip 无 .pi/.task" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --name-only "$AUDITED" -- .pi .task)" ]]'
+is_true "远端 main 无 .pi/.task" '[[ -z "$(git -C "$ROOT/remote.git" ls-tree -r --name-only refs/heads/main -- .pi .task)" ]]'
+exists ".pi/ 运行日志确实还在工作区" "$WORKTREE/.pi/tasks/run.log"
+
+# ---------------------------------------------------------------------------
+CASE="untracked_pi_not_dirty_without_exclude"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=piartifacts_noexclude STUB_AGY=pass
+run_worker
+EXCLUDE="$REPO/.git/info/exclude"
+eq "前提：exclude 里确实没有 .pi/" "$(grep -cxF '.pi/' "$EXCLUDE" 2>/dev/null || true)" "0"
+is_true "排除规则缺失时 status 确实列出 .pi/" '[[ -n "$(git -C "$WORKTREE" status --porcelain -uall | grep -E "^\\?\\? \\.pi/")" ]]'
+eq "仍然不判 dirty_worktree" "$(done_field audit_reason)" "ok"
+eq "仍能合推" "$(done_field auto_merged)" "1"
+AUDITED="$(payload_field audited_commit)"
+is_true "待审 tip 无 .pi/.task" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --name-only "$AUDITED" -- .pi .task)" ]]'
 
 # ---------------------------------------------------------------------------
 CASE="merge_gate_task_dir_in_audited_tree"
