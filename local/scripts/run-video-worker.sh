@@ -30,7 +30,8 @@ fi
 git -C "$HOME/strategy-stack" pull --ff-only >/dev/null 2>&1 || true
 
 # 1. 24G 内存与 2 并发硬门禁检查（与墨翟共享同一物理算力池）
-ACTIVE_JOBS=$(pgrep -fc "pi|ffmpeg|agy" || true)
+# 锚定完整命令词，避免 brave/grok/pipewire/acpi/napi 等含 "pi" 的无关进程被计入
+ACTIVE_JOBS=$(pgrep -fc '(^|/)(pi|agy|ffmpeg)( |$)' || true)
 FREE_MEM=$(free -m | awk '/^Mem:/{print $7}')
 if [[ "$ACTIVE_JOBS" -ge 2 ]] || [[ "$FREE_MEM" -lt 6000 ]]; then
   echo "[GATE_BLOCKED] active_jobs=$ACTIVE_JOBS, free_mem=${FREE_MEM}MB (<6000MB)"
