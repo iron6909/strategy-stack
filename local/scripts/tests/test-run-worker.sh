@@ -33,6 +33,7 @@ new_fixture() {
   printf '[user]\n\tname = Test\n\temail = test@example.invalid\n' > "$HOME/.gitconfig"
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
   unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
+  PROMPT_SRC=""
 
   BIN="$ROOT/bin"
   mkdir -p "$BIN"
@@ -43,10 +44,57 @@ new_fixture() {
   cat > "$BIN/pi" <<'PI'
 #!/usr/bin/env bash
 printf 'pi %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+CUSTOMONLY=0
 case "${STUB_PI:-ok}" in
   fail)  exit 7 ;;
   dirty) echo dirty >> ./f.txt; exit 0 ;;
   none)  exit 0 ;;
+  customonly)
+    # 只动 custom/：应当被双绿灯放行
+    CUSTOMONLY=1
+    mkdir -p custom/tools
+    echo tool > custom/tools/tool.py
+    echo tweak >> custom/keep.txt ;;
+  newroot)
+    CUSTOMONLY=1
+    echo new > notes.md ;;
+  upstreammod)
+    CUSTOMONLY=1
+    echo cheat >> Makefile ;;
+  delroot)
+    CUSTOMONLY=1
+    git rm -q Makefile ;;
+  rootagents)
+    CUSTOMONLY=1
+    echo "- 作弊追加" >> AGENTS.md ;;
+  rmcharter)
+    CUSTOMONLY=1
+    git rm -q custom/AGENTS.md ;;
+  symlinkcharter)
+    CUSTOMONLY=1
+    rm -f custom/AGENTS.md
+    ln -s /etc/hostname custom/AGENTS.md ;;
+  renameout)
+    CUSTOMONLY=1
+    mkdir -p docs
+    git mv custom/keep.txt docs/keep.txt ;;
+  spaceout)
+    CUSTOMONLY=1
+    mkdir -p "docs dir"
+    echo x > "docs dir/a b.md" ;;
+  newlineout)
+    CUSTOMONLY=1
+    mkdir -p "docs dir"
+    printf 'x\n' > "docs dir/$(printf 'a\nb').md" ;;
+  outtracked)
+    # 模拟 agent 用 -f 把运行目录入库（.task/out/projects），并留下真实 custom/ 改动
+    CUSTOMONLY=1
+    mkdir -p out projects .task/evidence custom/tools
+    echo o > out/run.log
+    echo p > projects/p.json
+    echo t > .task/evidence/t.txt
+    echo tool > custom/tools/out.py
+    git add -f out projects .task ;;
   piartifacts|piartifacts_noexclude)
     # pi 运行时在 worktree 留下未跟踪的 .pi/（不得入库，也不得被判成脏树）
     mkdir -p .pi/tasks
@@ -68,9 +116,14 @@ if [[ -n "${STUB_PI_EVIDENCE_FILES:-}" ]]; then
     head -c "${STUB_PI_EVIDENCE_BYTES:-8000}" /dev/zero | tr '\0' 'e' > ".task/evidence/big-$i.log"
   done
 fi
-echo "feat-${STUB_PI:-ok}" >> feature.txt
-git add feature.txt
-git commit -qm "feat: stub work"
+if [[ "$CUSTOMONLY" -eq 0 ]]; then
+  echo "feat-${STUB_PI:-ok}" >> feature.txt
+  git add feature.txt
+  git commit -qm "feat: stub work"
+else
+  git add -A
+  git commit -qm "feat: stub work"
+fi
 # 模拟 agent 把 .task/ 证据入库（-f 绕过 info/exclude，正是本项目要防的场景）
 case "${STUB_PI_TASK:-}" in
   tracked)
@@ -116,6 +169,21 @@ case "${STUB_AGY:-pass}" in
     git add -f .task/evidence/proof.txt
     repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with .task")"
     git replace HEAD "$repl" ;;
+  treeout)
+    # 同上，但把 out/ 塞进已审树的视图：只能靠合入前的 ls-tree 闭锁拦住。
+    printf 'VERDICT: PASS\n[Consider] 无\n'
+    mkdir -p out
+    echo x > out/x.log
+    git add -f out
+    repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with out/")"
+    git replace HEAD "$repl" ;;
+  treeagents)
+    # 已审树里的根 AGENTS.md 被改：只能靠合入前的门禁复查拦住（行级 ls-tree 闭锁不管这个）
+    printf 'VERDICT: PASS\n[Consider] 无\n'
+    echo cheat >> AGENTS.md
+    git add AGENTS.md
+    repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with root AGENTS.md change")"
+    git replace HEAD "$repl" ;;
   *) printf 'VERDICT: PASS\n[Act On] 无\n[Consider] 无\n[Dismissed] 无\n' ;;
 esac
 AGY
@@ -150,7 +218,7 @@ CURL
 
 run_worker_at() {
   OUT="$(
-    bash "$SCRIPT" --repo "$1" --ticket "$TICKET" --prompt-file "$ROOT/prompt.md" 2>&1
+    bash "$SCRIPT" --repo "$1" --ticket "$TICKET" --prompt-file "${PROMPT_SRC:-$ROOT/prompt.md}" 2>&1
   )"
   RC=$?
   DONE_LINE="$(printf '%s\n' "$OUT" | grep '^\[DONE\]' | tail -n1)"
@@ -158,7 +226,7 @@ run_worker_at() {
 run_worker() { run_worker_at "$REPO"; }
 run_worker_audit_only() {
   OUT="$(
-    bash "$SCRIPT" --repo "$REPO" --ticket "$TICKET" --prompt-file "$ROOT/prompt.md" --audit-only 2>&1
+    bash "$SCRIPT" --repo "$REPO" --ticket "$TICKET" --prompt-file "${PROMPT_SRC:-$ROOT/prompt.md}" --audit-only 2>&1
   )"
   RC=$?
   DONE_LINE="$(printf '%s\n' "$OUT" | grep '^\[DONE\]' | tail -n1)"
@@ -631,6 +699,339 @@ eq "exit code" "$RC" "0"
 eq "审计目标仍是既有分支 tip" "$(payload_field audited_commit)" "$TIP"
 eq "双绿灯合推" "$(done_field auto_merged)" "1"
 is_true "远端已含既有 tip" "git -C '$ROOT/remote.git' merge-base --is-ancestor '$TIP' refs/heads/main"
+
+# ---------------------------------------------------------------------------
+# MOZ-21：custom/AGENTS.md 注入 + 免侵入物理门禁
+# 门禁用例的 upstream 一律是临时 bare：remote.upstream.url 写 OpenMontage 公开源，
+# 用 url.*.insteadOf 把该 URL 重写到本地 bare，既不联网也不改 origin。
+make_charter_base() {
+  (
+    cd "$REPO" || exit 1
+    mkdir -p custom
+    printf '# 测试宪章\n- 只允许改 custom/\n' > custom/AGENTS.md
+    printf 'keep\n' > custom/keep.txt
+    echo upstream-original > Makefile
+    echo root-original > AGENTS.md
+    git add custom Makefile AGENTS.md
+    git commit -qm "chore(custom): seed charter"
+    git push -q origin main
+  ) >/dev/null 2>&1
+  INIT_SHA="$(git -C "$ROOT/remote.git" rev-parse refs/heads/main)"
+  CHARTER_HEAD="$ROOT/expected-head"
+  printf '%s\n\n%s\n\n' "$(cat "$REPO/custom/AGENTS.md")" "=== 本次具体工单任务 ===" > "$CHARTER_HEAD"
+  PROMPT_COPY_PATH="$ROOT/worktrees/$TICKET/.task/$TICKET-prompt.md"
+}
+
+seed_openmontage_upstream() {
+  git config --global "url.$ROOT/upstream.git.insteadOf" "https://github.com/calesthio/OpenMontage.git"
+  git -C "$REPO" remote add upstream "https://github.com/calesthio/OpenMontage.git"
+  git -C "$REPO" fetch -q upstream main
+}
+
+new_charter_fixture() {
+  new_fixture
+  make_charter_base
+  git clone -q --bare "$ROOT/remote.git" "$ROOT/upstream.git"
+  seed_openmontage_upstream
+}
+
+# 历史 base 已合入 custom/ 以外残留：上游快照先拍，main 上再塞一处越界改动。
+# 三点 diff（base...commit）看不见它，两点 vs upstream 必须抓得到。
+new_residue_fixture() {
+  new_fixture
+  make_charter_base
+  git clone -q --bare "$ROOT/remote.git" "$ROOT/upstream.git"
+  (
+    cd "$REPO" || exit 1
+    echo "legacy residue" >> Makefile
+    git commit -qam "legacy change outside custom/ already on base"
+    git push -q origin main
+  ) >/dev/null 2>&1
+  INIT_SHA="$(git -C "$ROOT/remote.git" rev-parse refs/heads/main)"
+  seed_openmontage_upstream
+}
+
+audit_first_line() { sed -n '1p' "$WORKTREE/.task/$TICKET-audit.md" 2>/dev/null; }
+audit_body() { cat "$WORKTREE/.task/$TICKET-audit.md" 2>/dev/null; }
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_allows_custom_only"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+eq "exit code" "$RC" "0"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+eq "merge reason" "$(done_field merge_reason)" "merged_and_pushed"
+eq "远端 tip == merge_commit" "$(done_field merge_commit)" "$(remote_main)"
+is_true "远端已含 custom/tools/tool.py" '[[ -n "$(git -C "$ROOT/remote.git" ls-tree -r --name-only refs/heads/main -- custom/tools/tool.py)" ]]'
+is_true "远端 Makefile 未被改" '[[ "$(git -C "$ROOT/remote.git" show refs/heads/main:Makefile)" == "upstream-original" ]]'
+printf '  proof: merge_commit=%s remote_main=%s\n' "$(done_field merge_commit)" "$(remote_main)"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_prompt_injection"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+P="$PROMPT_COPY_PATH"
+HEAD_BYTES="$(stat -c %s "$CHARTER_HEAD")"
+eq "审查通过" "$(done_field audit)" "PASS"
+exists "有效提示文件存在" "$P"
+if cmp -s -n "$HEAD_BYTES" -i 0 "$CHARTER_HEAD" "$P"; then
+  ok "首部 = 宪章全文 + 空行 + 分隔行 + 空行"
+else
+  no "首部 = 宪章全文 + 空行 + 分隔行 + 空行"
+fi
+eq "分隔行只出现一次" "$(grep -cxF '=== 本次具体工单任务 ===' "$P")" "1"
+eq "宪章标题只出现一次" "$(grep -cxF '# 测试宪章' "$P")" "1"
+eq "原 prompt 正文仍在尾部" "$(tail -n1 "$P")" "$(tail -n1 "$ROOT/prompt.md")"
+is_true "提示文件不是截空的（比宪章头更长）" '[[ "$(stat -c %s "$P")" -gt "$HEAD_BYTES" ]]'
+is_true "pi 收到的是注入后的提示" '[[ "$(grep -cxF "=== 本次具体工单任务 ===" "$ROOT/stub.log")" -ge 1 ]]'
+match "review bundle 含宪章" "$(cat "$WORKTREE/.task/review-bundle.txt" 2>/dev/null)" "只允许改 custom/"
+match "送审 prompt 含宪章" "$(cat "$WORKTREE/.task/audit-prompt.txt" 2>/dev/null)" "只允许改 custom/"
+printf '  proof: charter_head=%s bytes prompt_copy=%s bytes\n' "$HEAD_BYTES" "$(stat -c %s "$P")"
+# resume/二次派发：把已注入的文件当源再跑一次，宪章不得叠第二层
+cp "$P" "$ROOT/prompt-injected.md"
+PROMPT_SRC="$ROOT/prompt-injected.md"
+export STUB_PI=none
+run_worker
+eq "resume 幂等合推" "$(done_field merge_reason)" "already_merged"
+eq "resume 后分隔行仍只有一层" "$(grep -cxF '=== 本次具体工单任务 ===' "$P")" "1"
+eq "resume 后宪章仍只有一份" "$(grep -cxF '# 测试宪章' "$P")" "1"
+eq "resume 后正文仍是原 prompt" "$(tail -n1 "$P")" "$(tail -n1 "$ROOT/prompt.md")"
+if cmp -s -n "$HEAD_BYTES" -i 0 "$CHARTER_HEAD" "$P"; then
+  ok "resume 后注入头未变"
+else
+  no "resume 后注入头未变"
+fi
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_rejects_upstream_add_modify_delete"
+printf '\n[%s]\n' "$CASE"
+for mode in newroot upstreammod delroot rootagents; do
+  case "$mode" in
+    newroot)     expect='notes\.md' ;;
+    upstreammod) expect='Makefile' ;;
+    delroot)     expect='Makefile' ;;
+    rootagents)  expect='AGENTS\.md' ;;
+  esac
+  new_charter_fixture
+  export STUB_PI="$mode" STUB_AGY=pass
+  run_worker
+  eq "$mode: audit reason" "$(done_field audit_reason)" "custom_gate_violation"
+  eq "$mode: audit 首行恰为 VERDICT: FAIL" "$(audit_first_line)" "VERDICT: FAIL"
+  match "$mode: 列出越界路径" "$(audit_body)" "\[Act On\] base:$expect"
+  match "$mode: upstream 侧也列出" "$(audit_body)" "\[Act On\] upstream:$expect"
+  eq "$mode: auto_merged" "$(done_field auto_merged)" "0"
+  eq "$mode: 远端未变" "$(remote_main)" "$INIT_SHA"
+  is_true "$mode: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+  is_true "$mode: 合推日志为空（未尝试合推）" '[[ ! -s "$WORKTREE/.task/$TICKET-merge.txt" ]]'
+  exists "$mode: worktree 保留" "$WORKTREE"
+  exists "$mode: 证据保留" "$WORKTREE/.task/evidence/proof.txt"
+done
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_rejects_charter_escape"
+printf '\n[%s]\n' "$CASE"
+for mode in rmcharter symlinkcharter; do
+  case "$mode" in
+    rmcharter)      expect='charter_missing:custom/AGENTS\.md' ;;
+    symlinkcharter) expect='charter_not_regular:custom/AGENTS\.md' ;;
+  esac
+  new_charter_fixture
+  export STUB_PI="$mode" STUB_AGY=pass
+  run_worker
+  eq "$mode: 仍然开闸（防删除/换链接逃逸）" "$(done_field audit_reason)" "custom_gate_violation"
+  eq "$mode: audit 首行恰为 VERDICT: FAIL" "$(audit_first_line)" "VERDICT: FAIL"
+  match "$mode: 列出宪章违规" "$(audit_body)" "$expect"
+  eq "$mode: auto_merged" "$(done_field auto_merged)" "0"
+  eq "$mode: 远端未变" "$(remote_main)" "$INIT_SHA"
+  is_true "$mode: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+done
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_rejects_cross_boundary_rename"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=renameout STUB_AGY=pass
+run_worker
+eq "audit reason" "$(done_field audit_reason)" "custom_gate_violation"
+match "rename 目标侧（越界）列出" "$(audit_body)" '\[Act On\] base:docs/keep\.txt'
+is_true "rename 源侧在 custom/ 内不算越界" '[[ "$(audit_body)" != *"base:custom/keep.txt"* ]]'
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_rejects_weird_paths"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=spaceout STUB_AGY=pass
+run_worker
+eq "含空格: audit reason" "$(done_field audit_reason)" "custom_gate_violation"
+match "含空格的越界路径完整列出" "$(audit_body)" '\[Act On\] base:docs dir/a b\.md'
+eq "含空格: auto_merged" "$(done_field auto_merged)" "0"
+
+new_charter_fixture
+export STUB_PI=newlineout STUB_AGY=pass
+run_worker
+eq "含换行: audit reason" "$(done_field audit_reason)" "custom_gate_violation"
+# 含换行路径在 eval 里使用，export 以免被当成未使用变量
+export NL_PATH="$(printf '[Act On] base:docs dir/a\nb.md')"
+is_true "含换行的越界路径完整列出（NUL 分隔未串行）" 'grep -qF "$NL_PATH" "$WORKTREE/.task/$TICKET-audit.md"'
+eq "含换行: auto_merged" "$(done_field auto_merged)" "0"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_two_point_vs_upstream"
+printf '\n[%s]\n' "$CASE"
+new_residue_fixture
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+AUDITED="$(payload_field audited_commit)"
+eq "历史残留被抓" "$(done_field audit_reason)" "custom_gate_violation"
+match "upstream 两点比对列出 Makefile" "$(audit_body)" '\[Act On\] upstream:Makefile'
+is_true "三点 diff 看不见残留（所以必须两点）" '[[ -z "$(git -C "$WORKTREE" diff --name-only "$INIT_SHA...$AUDITED" -- Makefile)" ]]'
+is_true "两点 diff vs upstream 才抓到" '[[ -n "$(git -C "$WORKTREE" diff --name-only "$AUDITED" refs/remotes/upstream/main -- Makefile)" ]]'
+printf '  proof: base=%s audited=%s upstream=%s\n' "$INIT_SHA" "$AUDITED" "$(git -C "$WORKTREE" rev-parse refs/remotes/upstream/main)"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_upstream_ref_fail_closed"
+printf '\n[%s]\n' "$CASE"
+# 1) 根本没配 upstream remote
+new_fixture
+make_charter_base
+git clone -q --bare "$ROOT/remote.git" "$ROOT/upstream.git"
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+eq "缺失 remote: audit reason" "$(done_field audit_reason)" "custom_gate_upstream_ref_missing"
+eq "缺失 remote: auto_merged" "$(done_field auto_merged)" "0"
+eq "缺失 remote: 远端未变" "$(remote_main)" "$INIT_SHA"
+is_true "缺失 remote: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+match "缺失 remote: audit 写明 reason" "$(audit_body)" 'upstream_ref_missing'
+# 2) URL 对了但从未 fetch 出 ref
+new_fixture
+make_charter_base
+git -C "$REPO" remote add upstream "https://github.com/calesthio/OpenMontage.git"
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+eq "未 fetch: audit reason" "$(done_field audit_reason)" "custom_gate_upstream_ref_missing"
+eq "未 fetch: 远端未变" "$(remote_main)" "$INIT_SHA"
+# 3) ref 存在但 remote URL 不是公开源
+new_fixture
+make_charter_base
+git clone -q --bare "$ROOT/remote.git" "$ROOT/upstream.git"
+git -C "$REPO" remote add upstream "https://example.invalid/OpenMontage.git"
+git -C "$REPO" fetch -q "$ROOT/upstream.git" main:refs/remotes/upstream/main
+export STUB_PI=customonly STUB_AGY=pass
+run_worker
+eq "错 URL: audit reason" "$(done_field audit_reason)" "custom_gate_upstream_ref_missing"
+eq "错 URL: 远端未变" "$(remote_main)" "$INIT_SHA"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_no_charter_not_enabled"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=upstreammod STUB_AGY=pass
+run_worker
+P="$WORKTREE/.task/$TICKET-prompt.md"
+eq "无宪章仓库审查通过（门禁不误开）" "$(done_field audit)" "PASS"
+eq "audit reason" "$(done_field audit_reason)" "ok"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+eq "未注入分隔行" "$(grep -cxF '=== 本次具体工单任务 ===' "$P")" "0"
+if cmp -s "$P" "$ROOT/prompt.md"; then
+  ok "有效提示文件与原 prompt 逐字节一致"
+else
+  no "有效提示文件与原 prompt 逐字节一致"
+fi
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_untracks_runtime_dirs"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=outtracked STUB_AGY=pass STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+AUDITED="$(payload_field audited_commit)"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+is_true "已审 SHA 换成不含运行目录的 tree" '[[ "$AUDITED" != "$PI_SHA" ]]'
+is_true "已审 tree 无 .task/out/projects/.pi" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --name-only "$AUDITED" -- .task out projects .pi)" ]]'
+is_true "远端 main 无 .task/out/projects/.pi" '[[ -z "$(git -C "$ROOT/remote.git" ls-tree -r --name-only refs/heads/main -- .task out projects .pi)" ]]'
+exists "out/ 产物仍在工作区" "$WORKTREE/out/run.log"
+exists ".task 证据仍在工作区" "$WORKTREE/.task/evidence/t.txt"
+printf '  proof: pi_sha=%s audited=%s\n' "$PI_SHA" "$AUDITED"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_merge_recheck_tree_lock"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=customonly STUB_AGY=treeout STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+eq "agy 侧审查通过" "$(done_field audit)" "PASS"
+eq "合入前 ls-tree 闭锁拦住 out/" "$(done_field merge_reason)" "task_dir_in_audited_tree"
+eq "auto_merged" "$(done_field auto_merged)" "0"
+eq "已审 SHA 未被改" "$(git -C "$WORKTREE" rev-parse HEAD)" "$PI_SHA"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+match "合推日志记录运行目录" "$(cat "$WORKTREE/.task/$TICKET-merge.txt" 2>/dev/null)" 'out/x.log'
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_merge_recheck_gate"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+export STUB_PI=customonly STUB_AGY=treeagents STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+eq "agy 侧审查通过" "$(done_field audit)" "PASS"
+eq "合入前门禁复查拦住根 AGENTS.md" "$(done_field merge_reason)" "custom_gate_violation"
+eq "auto_merged" "$(done_field auto_merged)" "0"
+eq "已审 SHA 未被改" "$(git -C "$WORKTREE" rev-parse HEAD)" "$PI_SHA"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+match "合推日志列出越界路径" "$(cat "$WORKTREE/.task/$TICKET-merge.txt" 2>/dev/null)" 'AGENTS\.md'
+exists "worktree 与证据保留" "$WORKTREE/.task/evidence/proof.txt"
+
+# ---------------------------------------------------------------------------
+CASE="custom_gate_audit_only"
+printf '\n[%s]\n' "$CASE"
+new_charter_fixture
+git -C "$REPO" worktree add -q "$WORKTREE" -b "feat/$TICKET" main
+(
+  cd "$WORKTREE" || exit 1
+  echo cheat >> Makefile
+  git commit -qam "cheat: touch upstream file"
+) >/dev/null 2>&1
+export STUB_AGY=pass
+run_worker_audit_only
+eq "exit code" "$RC" "0"
+eq "--audit-only 同样拦截" "$(done_field audit_reason)" "custom_gate_violation"
+eq "audit 首行恰为 VERDICT: FAIL" "$(audit_first_line)" "VERDICT: FAIL"
+match "列出 Makefile" "$(audit_body)" '\[Act On\] base:Makefile'
+is_true "未启动 agy" '[[ -z "$(agy_lines)" ]]'
+eq "auto_merged" "$(done_field auto_merged)" "0"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+exists "提示文件已生成" "$PROMPT_COPY_PATH"
+HEAD_BYTES="$(stat -c %s "$CHARTER_HEAD")"
+if cmp -s -n "$HEAD_BYTES" -i 0 "$CHARTER_HEAD" "$PROMPT_COPY_PATH"; then
+  ok "--audit-only 也注入宪章"
+else
+  no "--audit-only 也注入宪章"
+fi
+match "--audit-only bundle 含宪章" "$(cat "$WORKTREE/.task/review-bundle.txt" 2>/dev/null)" "只允许改 custom/"
+# 正例：只改 custom/ 的 tip 在 --audit-only 下仍可双绿灯合推
+new_charter_fixture
+git -C "$REPO" worktree add -q "$WORKTREE" -b "feat/$TICKET" main
+(
+  cd "$WORKTREE" || exit 1
+  mkdir -p custom/tools
+  echo tool > custom/tools/only.py
+  git add -A custom
+  git commit -qm "feat: custom only"
+) >/dev/null 2>&1
+export STUB_AGY=pass
+run_worker_audit_only
+eq "正例: 审查通过" "$(done_field audit)" "PASS"
+eq "正例: 双绿灯合推" "$(done_field auto_merged)" "1"
+eq "正例: merge reason" "$(done_field merge_reason)" "merged_and_pushed"
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
