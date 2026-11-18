@@ -30,7 +30,7 @@
 - [ ] **Step 3: 接收 Webhook 回调并按 `auto_merged` 分流 (`Process Callback`)**
   被 Webhook 唤醒后，通过 Tailscale 读取 `.task/<工单号>-audit.md`、`.task/<工单号>-merge.txt`、`.task/webhook-payload.json` 与 `evidence_dir`：
   - **`auto_merged == 1`**：本地已 `--no-ff` 合入 `main` 且推送核实成功（`merge_commit` 已在远端）。在工单评论区贴出交付摘要、`agy` 审查结论、`merge_commit`、`review_bundle` 与 `evidence_dir`，将工单直接推进为 **`Done`**，并在**同一回合**继续 Step 4。
-  - **`auto_merged == 0` 且返工未满 2 次**：把 `audit_reason` / `merge_reason`（如 `verdict_fail`、`empty_report`、`verdict_not_exact_first_line`、`dirty_worktree`、`post_audit_worktree_changed`、`base_changed`、`merge_conflict`、`push_rejected`）与审查缺陷追加进提示词，调 `run-worker.sh --resume "$session_file"` 原地返工。若工单实现已在 `feat/<工单号>` 提交、只需重做审查（如 `agy` 因参数超长根本没跑起来），改用 `run-worker.sh --audit-only`：不跑 pi、不 `--resume`、不改实现，复用既有 worktree/tip 重建 bundle 再审查，工作区存在未提交的实现改动时直接判 `dirty_worktree`。
+  - **`auto_merged == 0` 且返工未满 2 次**：把 `audit_reason` / `merge_reason`（如 `verdict_fail`、`empty_report`、`verdict_not_exact_first_line`、`dirty_worktree`、`post_audit_worktree_changed`、`base_changed`、`merge_conflict`、`push_rejected`、`custom_gate_violation`、`custom_gate_upstream_ref_missing`）与审查缺陷追加进提示词，调 `run-worker.sh --resume "$session_file"` 原地返工。若工单实现已在 `feat/<工单号>` 提交、只需重做审查（如 `agy` 因参数超长根本没跑起来），改用 `run-worker.sh --audit-only`：不跑 pi、不 `--resume`、不改实现，复用既有 worktree/tip 重建 bundle 再审查，工作区存在未提交的实现改动时直接判 `dirty_worktree`。
   - **回调 JSON 缺少 `auto_merged` 字段**（旧版脚本）：一律视为未合入，**严禁**擅自标 `Done`，按 `audit_verdict` 转人工核验。
   - **连续 2 次同一假设失败**：确认本地工作区已回滚，将工单挂 **`Blocked`**，以 `Blocked` 状态报给 Sirus。
   - 并发锁（`[LOCK_BLOCKED]`）、基线变化、脏仓库、merge 冲突、推送拒绝：`AUTO_MERGED=0`，worktree 与证据保留；脚本从不 `--force` 删除工作树，证据先归档到 `~/task-archive/<工单号>/`。
