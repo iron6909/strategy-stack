@@ -4,10 +4,11 @@ description: 本地 Gemini Pro 纯文本双轴只读审查与硬判定标准
 ---
 
 # 本地双轴只读审查标准
-由 `run-worker.sh` 在 `Pi` 完成后自动拉起 `agy -p`（Gemini Pro）执行**纯文本**审查：
+由 `run-worker.sh` 在 `Pi` 完成后自动拉起 `agy`（Gemini Pro）执行**纯文本**审查：
 
 ## 调用与输入
-- 调用参数固定：`agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m -p "$PROMPT" < /dev/null`。
+- 调用参数固定：`agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m --input-format text < "$AUDIT_PROMPT_FILE"`；完整 prompt 先写入 `.task/audit-prompt.txt`，从 stdin 读到 EOF 送审。
+- 绝不把审查全文放进 argv：Linux 单参数上限约 128KiB（`MAX_ARG_STRLEN`），146KB 的 bundle 用 `-p "$(cat ...)"` 会直接 `Argument list too long` 退出 126；`-p -` 也只把 `-` 当 prompt。
 - 审查材料由 Bash 预打包成 `$WORKTREE_DIR/.task/review-bundle.txt`（脱敏、无 secret）：任务书原文、`.task/evidence/` 文本证据、变更文件清单、以及绑定到「当前已审 commit」的 `git diff`。
 - prompt 首句硬性禁止调用任何工具（禁止 bash/shell/终端/文件读写/搜索/编辑/MCP），审查方只能读这条消息里的文本；`--dangerously-skip-permissions` 只解除弹出式授权，不授予工具使用权，也不代表允许改文件。
 - 从 SSH 派发时，`agy` 检测到 SSH 会改走文件凭证并表现为未登录：脚本在子进程环境中摘掉 `SSH_CONNECTION`/`SSH_CLIENT`/`SSH_TTY`/`SSH_AUTH_SOCK`，复用本机已登录 keyring。严禁读取、拷贝、打印任何 token/凭据文件，严禁改平台安全控制，严禁创建或切换 named agent 账户。

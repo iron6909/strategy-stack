@@ -8,6 +8,7 @@ TICKET_ID=""
 PROMPT_FILE=""
 BASE_BRANCH="main"
 RESUME_SESSION=""
+AUDIT_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -16,12 +17,13 @@ while [[ $# -gt 0 ]]; do
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
     --base-branch) BASE_BRANCH="$2"; shift 2 ;;
     --resume) RESUME_SESSION="$2"; shift 2 ;;
+    --audit-only) AUDIT_ONLY=1; shift ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
 if [[ -z "$REPO_DIR" || -z "$TICKET_ID" || -z "$PROMPT_FILE" ]]; then
-  echo "Usage: $0 --repo <path> --ticket <MOZ-12> --prompt-file <path> [--base-branch main] [--resume <session_jsonl>]"
+  echo "Usage: $0 --repo <path> --ticket <MOZ-12> --prompt-file <path> [--base-branch main] [--resume <session_jsonl>] [--audit-only]"
   exit 1
 fi
 
@@ -45,6 +47,7 @@ EVIDENCE_DIR="$TASK_DIR/evidence"
 PROMPT_COPY="$TASK_DIR/$TICKET_ID-prompt.md"
 AUDIT_FILE="$TASK_DIR/$TICKET_ID-audit.md"
 BUNDLE_FILE="$TASK_DIR/review-bundle.txt"
+AUDIT_PROMPT_FILE="$TASK_DIR/audit-prompt.txt"
 MERGE_LOG="$TASK_DIR/$TICKET_ID-merge.txt"
 PAYLOAD_FILE="$TASK_DIR/webhook-payload.json"
 ARCHIVE_DIR="$HOME/task-archive/$TICKET_ID"
@@ -102,7 +105,14 @@ ensure_common_excludes() {
 
 # 3. 准备隔离的 Git Worktree
 mkdir -p "$WORKTREE_ROOT"
-if [[ ! -d "$WORKTREE_DIR" ]]; then
+if [[ ! -d "$WORKTREE_DIR" && "$AUDIT_ONLY" -eq 1 ]]; then
+  # --audit-only 只重审既有 tip：没有 worktree 就复用既有分支，绝不新建空分支
+  if ! git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    echo "[FAIL] --audit-only 需要既有 worktree 或分支 $BRANCH_NAME"
+    exit 4
+  fi
+  git -C "$REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH_NAME"
+elif [[ ! -d "$WORKTREE_DIR" ]]; then
   git -C "$REPO_DIR" fetch origin "$BASE_BRANCH" >/dev/null 2>&1 || true
   if git -C "$REPO_DIR" show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     git -C "$REPO_DIR" worktree add "$WORKTREE_DIR" "$BRANCH_NAME"
@@ -127,18 +137,23 @@ cp "$PROMPT_FILE" "$PROMPT_COPY"
 
 # 4. 无头运行 Pi Coding Agent（挂载 OpenCode Go 高配额模型，stdin 必须闭合）
 cd "$WORKTREE_DIR"
-set +e
-if [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
-  pi --session-dir "$TASK_DIR/sessions" --session "$RESUME_SESSION" --mode json \
-     -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+SES_FILE=""
+if [[ "$AUDIT_ONLY" -eq 1 ]]; then
+  # 不跑 pi、不 --resume、不改实现：只复用当前 feat/<ticket> tip 重做异构审查
+  PI_EXIT=0
 else
-  pi --session-dir "$TASK_DIR/sessions" --mode json \
-     -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+  set +e
+  if [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
+    pi --session-dir "$TASK_DIR/sessions" --session "$RESUME_SESSION" --mode json \
+       -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+  else
+    pi --session-dir "$TASK_DIR/sessions" --mode json \
+       -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+  fi
+  PI_EXIT=$?
+  set -e
+  SES_FILE=$(ls -t "$TASK_DIR/sessions/"*.jsonl 2>/dev/null | head -n 1 || echo "")
 fi
-PI_EXIT=$?
-set -e
-
-SES_FILE=$(ls -t "$TASK_DIR/sessions/"*.jsonl 2>/dev/null | head -n 1 || echo "")
 AUDIT_VERDICT="SKIPPED"
 AUDIT_REASON="pi_failed"
 AGY_EXIT=""
@@ -347,11 +362,11 @@ json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 archive_evidence() {
   mkdir -p "$ARCHIVE_DIR"
   cp -a "$EVIDENCE_DIR" "$ARCHIVE_DIR/" 2>/dev/null || true
-  cp -a "$AUDIT_FILE" "$BUNDLE_FILE" "$MERGE_LOG" "$TASK_DIR/$TICKET_ID.jsonl" "$ARCHIVE_DIR/" 2>/dev/null || true
+  cp -a "$AUDIT_FILE" "$BUNDLE_FILE" "$AUDIT_PROMPT_FILE" "$MERGE_LOG" "$TASK_DIR/$TICKET_ID.jsonl" "$ARCHIVE_DIR/" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
-# 5. 纯文本异构审查（Gemini Pro agy -p，只读、无工具、首行硬判定）
+# 5. 纯文本异构审查（Gemini Pro agy 读 stdin，只读、无工具、首行硬判定）
 # ---------------------------------------------------------------------------
 if [[ "$PI_EXIT" -eq 0 ]]; then
   git -C "$WORKTREE_DIR" fetch origin "$BASE_BRANCH" >/dev/null 2>&1 || true
@@ -377,21 +392,29 @@ if [[ "$PI_EXIT" -eq 0 ]]; then
     AUDIT_VERDICT="FAIL"; AUDIT_REASON="agy_missing"
   else
     build_review_bundle
-    AUDIT_PROMPT="你是独立只读代码审查官，本轮只做纯文本审查。
+    # 审查 prompt 全文落盘后从 stdin 送审：Linux 单参数上限约 128KiB（MAX_ARG_STRLEN），
+    # 146KB 的 bundle 放进 -p 会让 agy 以 126 Argument list too long 直接退出、审查根本没启动。
+    # agy 的 -p/--print 必须带非空参数，-p - 只把 "-" 当 prompt，所以用 --input-format text
+    # （print 模式文档化输入格式）读 stdin 到 EOF。
+    {
+      cat <<'AUDIT_PROMPT_HEAD'
+你是独立只读代码审查官，本轮只做纯文本审查。
 【硬性禁令】禁止调用任何工具：不得使用 bash/shell/终端/文件读写/搜索/编辑/MCP 等任何工具或扩展命令，你只能阅读本条消息里的文本。违反本禁令即判 FAIL。
 【输出格式】第一行必须且只能是下面两者之一，前后不得有任何字符、反引号、标题或空行：
 VERDICT: PASS
 VERDICT: FAIL
 第二行起按 [Act On]、[Consider]、[Dismissed] 三级分流输出精简中文报告，覆盖 Standards 规范轴（AGENTS.md 约定、类型安全、Laziness Protocol）与 Spec & Proof 实绩轴（任务书 Done Check 是否 100% 交付、证据是否真实可复核）。
 【审查材料】
-$(cat "$BUNDLE_FILE")"
+AUDIT_PROMPT_HEAD
+      cat "$BUNDLE_FILE"
+    } > "$AUDIT_PROMPT_FILE"
 
     set +e
     # SSH 会话下 agy 会改走文件凭证并表现为未登录：子进程摘掉 SSH_* 复用本机已登录 keyring。
     # 只摘环境变量，不读取/拷贝/打印任何 token 或凭据文件，不改平台安全控制。
     env -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY -u SSH_AUTH_SOCK \
       agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m \
-      -p "$AUDIT_PROMPT" < /dev/null > "$AUDIT_FILE" 2>&1
+      --input-format text < "$AUDIT_PROMPT_FILE" > "$AUDIT_FILE" 2>&1
     AGY_EXIT=$?
     set -e
 

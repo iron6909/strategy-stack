@@ -32,6 +32,7 @@ new_fixture() {
   mkdir -p "$HOME/.harness/webhooks"
   printf '[user]\n\tname = Test\n\temail = test@example.invalid\n' > "$HOME/.gitconfig"
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
+  unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
 
   BIN="$ROOT/bin"
   mkdir -p "$BIN"
@@ -61,6 +62,12 @@ case "${STUB_PI:-ok}" in
 esac
 mkdir -p .task/evidence
 echo "proof line for ${STUB_PI:-ok}" > .task/evidence/proof.txt
+# 模拟真实工单里体积很大的文本证据（MOZ-17 的 bundle 就是这样胀到 146KB 的）
+if [[ -n "${STUB_PI_EVIDENCE_FILES:-}" ]]; then
+  for i in $(seq 1 "$STUB_PI_EVIDENCE_FILES"); do
+    head -c "${STUB_PI_EVIDENCE_BYTES:-8000}" /dev/zero | tr '\0' 'e' > ".task/evidence/big-$i.log"
+  done
+fi
 echo "feat-${STUB_PI:-ok}" >> feature.txt
 git add feature.txt
 git commit -qm "feat: stub work"
@@ -82,6 +89,13 @@ PI
   cat > "$BIN/agy" <<'AGY'
 #!/usr/bin/env bash
 printf 'agy %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+# 必须读满 stdin 到 EOF：用例拿字节数与哈希断言「送审内容未截断」
+STDIN_TMP="$(mktemp)"
+cat > "$STDIN_TMP"
+if [[ -n "${STUB_AGY_STDIN_BYTES:-}" ]]; then wc -c < "$STDIN_TMP" | tr -d ' ' > "$STUB_AGY_STDIN_BYTES"; fi
+if [[ -n "${STUB_AGY_STDIN_SHA:-}" ]]; then sha256sum "$STDIN_TMP" | cut -d' ' -f1 > "$STUB_AGY_STDIN_SHA"; fi
+if [[ -n "${STUB_AGY_STDIN_COPY:-}" ]]; then cp "$STDIN_TMP" "$STUB_AGY_STDIN_COPY"; fi
+rm -f "$STDIN_TMP"
 case "${STUB_AGY:-pass}" in
   fail)  printf 'VERDICT: FAIL\n[Act On] 缺真实证据\n' ;;
   empty) : ;;
@@ -142,12 +156,21 @@ run_worker_at() {
   DONE_LINE="$(printf '%s\n' "$OUT" | grep '^\[DONE\]' | tail -n1)"
 }
 run_worker() { run_worker_at "$REPO"; }
+run_worker_audit_only() {
+  OUT="$(
+    bash "$SCRIPT" --repo "$REPO" --ticket "$TICKET" --prompt-file "$ROOT/prompt.md" --audit-only 2>&1
+  )"
+  RC=$?
+  DONE_LINE="$(printf '%s\n' "$OUT" | grep '^\[DONE\]' | tail -n1)"
+}
 
 done_field() { printf '%s\n' "$DONE_LINE" | grep -oE "$1=[^ ]*" | tail -n1 | cut -d= -f2-; }
 payload_field() { sed -n "s/^  \"$1\": *//p" "$PAYLOAD" | sed -e 's/,$//' -e 's/^"//' -e 's/"$//'; }
 remote_main() { git -C "$ROOT/remote.git" rev-parse refs/heads/main; }
 remote_count() { git -C "$ROOT/remote.git" rev-list --count refs/heads/main; }
 worktree_field() { git -C "$WORKTREE" "$@"; }
+agy_lines() { grep '^agy ' "$ROOT/stub.log" 2>/dev/null || true; }
+agy_argv_maxlen() { awk '/^agy /{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$ROOT/stub.log" 2>/dev/null; }
 
 CASE="bash -n"
 if bash -n "$SCRIPT" 2>/dev/null; then ok "run-worker.sh 语法"; else no "run-worker.sh 语法"; fi
@@ -158,6 +181,7 @@ CASE="success_auto_merge_push"
 printf '\n[%s]\n' "$CASE"
 new_fixture
 export STUB_PI=ok STUB_AGY=pass
+export STUB_AGY_STDIN_BYTES="$ROOT/stdin.bytes" STUB_AGY_STDIN_SHA="$ROOT/stdin.sha"
 printf 'WEBHOOK_URL="http://127.0.0.1:1/hook"\nWEBHOOK_KEY="test-key"\n' > "$HOME/.harness/webhooks/mozi.env"
 export STUB_CURL_OUT="$ROOT/posted.json"
 run_worker
@@ -185,6 +209,10 @@ eq "webhook 投递体 auto_merged" "$(grep -oE '\"auto_merged\": [01]' "$ROOT/po
 eq "payload 向后兼容字段 pi_exit" "$(payload_field pi_exit)" "0"
 match "agy 使用纯文本审查参数" "$(cat "$ROOT/stub.log" 2>/dev/null)" "dangerously-skip-permissions"
 match "agy 禁用 slash/skill 展开" "$(cat "$ROOT/stub.log" 2>/dev/null)" "disable-slash-commands"
+exists "审查 prompt 全文落盘" "$WORKTREE/.task/audit-prompt.txt"
+is_true "agy 不再用 -p 传 prompt" '[[ "$(agy_lines)" != *" -p "* ]]'
+eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
+eq "agy stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
 
 # ---------------------------------------------------------------------------
 CASE="pi_failure"
@@ -488,6 +516,121 @@ eq "远端未变" "$(remote_main)" "$INIT_SHA"
 exists "worktree 保留" "$WORKTREE"
 exists ".task 证据保留" "$WORKTREE/.task/evidence/proof.txt"
 match "合推日志记录拒合原因" "$(cat "$WORKTREE/.task/$TICKET-merge.txt" 2>/dev/null)" "task_dir_in_audited_tree|audited tree still tracks"
+
+# ---------------------------------------------------------------------------
+# MOZ-18：bundle 超单参数上限（约 128KiB）时仍必须从 stdin 整份送审
+big_bundle_case() {
+  local files="$1" bytes="$2" label="$3" prompt_path total
+  printf '\n[%s]\n' "$CASE"
+  new_fixture
+  export STUB_PI=ok STUB_AGY=pass
+  export STUB_PI_EVIDENCE_FILES="$files" STUB_PI_EVIDENCE_BYTES="$bytes"
+  export STUB_AGY_STDIN_BYTES="$ROOT/stdin.bytes" STUB_AGY_STDIN_SHA="$ROOT/stdin.sha"
+  run_worker
+  prompt_path="$WORKTREE/.task/audit-prompt.txt"
+  total="$(stat -c %s "$prompt_path" 2>/dev/null || echo 0)"
+  eq "$label: exit code" "$RC" "0"
+  eq "$label: 审查通过" "$(done_field audit)" "PASS"
+  eq "$label: 双绿灯合推" "$(done_field auto_merged)" "1"
+  is_true "$label: 送审 prompt 超过 128KiB 单参数上限（$total bytes）" '[[ "$(cat "$STUB_AGY_STDIN_BYTES")" -gt 131072 ]]'
+  eq "$label: agy 从 stdin 读满全部字节（无截断）" "$(cat "$STUB_AGY_STDIN_BYTES")" "$total"
+  eq "$label: stdin 内容哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$prompt_path" | cut -d' ' -f1)"
+  is_true "$label: agy argv 无 -p" '[[ "$(agy_lines)" != *" -p "* ]]'
+  is_true "$label: agy argv 长度 < 1KB" '[[ "$(agy_argv_maxlen)" -lt 1024 ]]'
+  match "$label: agy 用 --input-format text 读 stdin" "$(agy_lines)" "--input-format text"
+  is_true "$label: argv 未混入 bundle 正文" '! grep -q "REVIEW BUNDLE" "$ROOT/stub.log"'
+  printf '  proof: %s prompt=%s bytes stdin=%s bytes argv_max=%s bytes\n' \
+    "$label" "$total" "$(cat "$STUB_AGY_STDIN_BYTES")" "$(agy_argv_maxlen)"
+}
+
+CASE="bundle_146k_audit_stdin"
+big_bundle_case 19 7700 "146KB"
+
+CASE="bundle_208k_audit_stdin"
+big_bundle_case 26 8000 "208KB"
+
+# ---------------------------------------------------------------------------
+CASE="audit_only_retry_existing_tip"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+# 模拟 MOZ-17：tip 已实现好、只重审不重写
+git -C "$REPO" worktree add -q "$WORKTREE" -b "feat/$TICKET" main
+(
+  cd "$WORKTREE" || exit 1
+  echo feat > feat.txt
+  git add feat.txt
+  git commit -qm "feat: existing tip"
+) >/dev/null 2>&1
+TIP="$(git -C "$WORKTREE" rev-parse HEAD)"
+mkdir -p "$WORKTREE/.task/evidence"   # .task/ 脚本产物不算未提交实现改动
+echo "prior proof" > "$WORKTREE/.task/evidence/prior.txt"
+export STUB_AGY=pass STUB_AGY_STDIN_BYTES="$ROOT/stdin.bytes" STUB_AGY_STDIN_SHA="$ROOT/stdin.sha"
+run_worker_audit_only
+PROMPT_PATH="$WORKTREE/.task/audit-prompt.txt"
+eq "exit code" "$RC" "0"
+is_true "未运行 pi" '[[ -z "$(grep "^pi " "$ROOT/stub.log" 2>/dev/null)" ]]'
+eq "已审 commit 就是既有 tip（未重写）" "$(payload_field audited_commit)" "$TIP"
+eq "worktree tip 未漂移" "$(git -C "$WORKTREE" rev-parse HEAD)" "$TIP"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+eq "merge reason" "$(done_field merge_reason)" "merged_and_pushed"
+eq "远端 tip == merge_commit" "$(done_field merge_commit)" "$(remote_main)"
+is_true "远端已含既有 tip" "git -C '$ROOT/remote.git' merge-base --is-ancestor '$TIP' refs/heads/main"
+eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$PROMPT_PATH")"
+eq "stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$PROMPT_PATH" | cut -d' ' -f1)"
+
+# ---------------------------------------------------------------------------
+CASE="audit_only_rejects_uncommitted_implementation"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+git -C "$REPO" worktree add -q "$WORKTREE" -b "feat/$TICKET" main
+(
+  cd "$WORKTREE" || exit 1
+  echo feat > feat.txt
+  git add feat.txt
+  git commit -qm "feat: existing tip"
+) >/dev/null 2>&1
+echo "uncommitted tweak" >> "$WORKTREE/feat.txt"
+export STUB_AGY=pass
+run_worker_audit_only
+eq "audit verdict" "$(done_field audit)" "FAIL"
+eq "audit reason" "$(done_field audit_reason)" "dirty_worktree"
+eq "auto_merged" "$(done_field auto_merged)" "0"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+is_true "审查未启动" '[[ -z "$(agy_lines)" ]]'
+absent "脏树不写审查报告" "$WORKTREE/.task/$TICKET-audit.md"
+exists "worktree 保留" "$WORKTREE"
+
+# ---------------------------------------------------------------------------
+CASE="audit_only_worktree_missing"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_AGY=pass
+run_worker_audit_only
+eq "exit code" "$RC" "4"
+match "拒绝无 tip 可审" "$OUT" "--audit-only"
+absent "未凭空建 worktree" "$WORKTREE"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+
+# ---------------------------------------------------------------------------
+CASE="audit_only_recreates_worktree_from_branch"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+git -C "$REPO" worktree add -q "$ROOT/tmpwt" -b "feat/$TICKET" main
+(
+  cd "$ROOT/tmpwt" || exit 1
+  echo feat > feat.txt
+  git add feat.txt
+  git commit -qm "feat: branch tip"
+) >/dev/null 2>&1
+TIP="$(git -C "$ROOT/tmpwt" rev-parse HEAD)"
+git -C "$REPO" worktree remove "$ROOT/tmpwt"
+export STUB_AGY=pass
+run_worker_audit_only
+eq "exit code" "$RC" "0"
+eq "审计目标仍是既有分支 tip" "$(payload_field audited_commit)" "$TIP"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+is_true "远端已含既有 tip" "git -C '$ROOT/remote.git' merge-base --is-ancestor '$TIP' refs/heads/main"
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
