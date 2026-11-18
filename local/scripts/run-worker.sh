@@ -64,6 +64,42 @@ fi
 echo "$$" > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT
 
+# 2.5 git common dir 工具（worktree 建好之前就要用，故定义在工具函数区之前）
+# 所有 worktree 共用主仓同一个 .git/info/exclude：--repo 本身可能是 worktree，
+# 必须解析成绝对路径，否则规则会被写进 worktree 里根本不存在的 .git/ 目录。
+resolve_git_common_dir() {
+  local repo="$1" abs_repo common
+  abs_repo="$(cd "$repo" 2>/dev/null && pwd -P)" || return 1
+  if common="$(git -C "$abs_repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+     && [[ "$common" == /* ]]; then
+    printf '%s\n' "$common"
+    return 0
+  fi
+  common="$(git -C "$abs_repo" rev-parse --git-common-dir)" || return 1
+  [[ -n "$common" ]] || return 1
+  # 旧 git / 相对输出：相对的是 repo 的实际路径（worktree 的 common dir 落在主仓 .git）
+  [[ "$common" == /* ]] || common="$abs_repo/$common"
+  printf '%s\n' "$common"
+}
+
+# .task/ out/ projects/ 是脚本自产目录：写进主仓 info/exclude，重复调用不得产生重复行。
+# exclude 只挡未跟踪文件，已 tracked 的 .task 只能靠 tree 检查，不能拿 ignore 当清除手段。
+ensure_common_excludes() {
+  local common="${1:-}" exclude entry
+  [[ -n "$common" ]] || return 1
+  exclude="$common/info/exclude"
+  mkdir -p "$common/info" || return 1
+  if [[ -s "$exclude" && -n "$(tail -c 1 "$exclude")" ]]; then
+    printf '\n' >> "$exclude" || return 1   # 原文件末尾无换行时先补齐，避免粘连出错误规则
+  fi
+  for entry in '.task/' 'out/' 'projects/'; do
+    if grep -qxF -- "$entry" "$exclude" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$entry" >> "$exclude" || return 1
+  done
+}
+
 # 3. 准备隔离的 Git Worktree
 mkdir -p "$WORKTREE_ROOT"
 if [[ ! -d "$WORKTREE_DIR" ]]; then
@@ -74,6 +110,16 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
     git -C "$REPO_DIR" worktree add "$WORKTREE_DIR" -b "$BRANCH_NAME" "$BASE_BRANCH"
   fi
 fi
+
+# worktree 建好（或复用既有 worktree）立即写 exclude：解析或写入失败一律失败退出
+COMMON_DIR="$(resolve_git_common_dir "$WORKTREE_DIR")" || {
+  echo "[FAIL] 无法解析 git common dir: worktree=$WORKTREE_DIR"
+  exit 4
+}
+ensure_common_excludes "$COMMON_DIR" || {
+  echo "[FAIL] 无法写入 $COMMON_DIR/info/exclude"
+  exit 4
+}
 
 mkdir -p "$TASK_DIR/sessions" "$EVIDENCE_DIR"
 cp "$PROMPT_FILE" "$PROMPT_COPY"
@@ -120,6 +166,56 @@ worktree_dirty() {
   [[ -n "$(git -C "$WORKTREE_DIR" status --porcelain -uall | grep -v '^?? \.task/' || true)" ]]
 }
 
+# 审查前失败出口：写明确 reason（无空格，直接进 webhook JSON），由调用方决定不进审查
+audit_fail() { AUDIT_VERDICT="FAIL"; AUDIT_REASON="$1"; }
+
+# 让即将送审的 tip 树不含 .task/，且清理动作本身必须成为待审提交的一部分：
+# 1) 已 tracked 的 .task -> git rm -r --cached + 提交（否则审查后改 index 就是审非所合）
+# 2) --no-ff 会把中间提交的 .task blob 带进 main 历史 -> 仅对未合入的 feat 分支做
+#    reset --soft（禁止 --hard / force-push）后再提交一棵同树的干净 tip
+# 3) 最后以 tree 为准复核（git add -f 能绕过 exclude，只有 tree 说了算）
+# 任何一步失败都返回非零，不吞错；原本就没有 tracked .task 是成功的 no-op。
+sanitize_audited_tip() {
+  local tracked orig_subject range commit task_paths
+  if ! tracked="$(git -C "$WORKTREE_DIR" ls-files -- .task)"; then
+    audit_fail task_ls_files_failed; return 1
+  fi
+  orig_subject="$(git -C "$WORKTREE_DIR" log -1 --format=%s)" || orig_subject=""
+  if [[ -n "$tracked" ]]; then
+    if ! git -C "$WORKTREE_DIR" rm -r --cached --quiet -- .task; then
+      audit_fail task_untrack_failed; return 1
+    fi
+    if ! git -C "$WORKTREE_DIR" commit -q -m "chore: untrack .task evidence from version control"; then
+      audit_fail task_untrack_commit_failed; return 1
+    fi
+  fi
+  if ! range="$(git -C "$WORKTREE_DIR" rev-list "$AUDITED_BASE..HEAD")"; then
+    audit_fail task_history_check_failed; return 1
+  fi
+  for commit in $range; do
+    if ! task_paths="$(git -C "$WORKTREE_DIR" ls-tree -r --name-only "$commit" -- .task)"; then
+      audit_fail task_history_check_failed; return 1
+    fi
+    if [[ -n "$task_paths" ]]; then
+      [[ -n "$orig_subject" ]] || orig_subject="feat: $TICKET_ID"
+      if ! git -C "$WORKTREE_DIR" reset --soft "$AUDITED_BASE"; then
+        audit_fail task_history_squash_failed; return 1
+      fi
+      if ! git -C "$WORKTREE_DIR" commit -q -m "$orig_subject"; then
+        audit_fail task_history_squash_failed; return 1
+      fi
+      break
+    fi
+  done
+  if ! task_paths="$(git -C "$WORKTREE_DIR" ls-tree -r --name-only HEAD -- .task)"; then
+    audit_fail task_tree_check_failed; return 1
+  fi
+  if [[ -n "$task_paths" ]]; then
+    audit_fail task_dir_in_audited_tree; return 1
+  fi
+  return 0
+}
+
 # shortcut: 只脱敏已知前缀与已知变量名，出现新密钥格式时升级
 redact() {
   sed -E \
@@ -160,10 +256,25 @@ build_review_bundle() {
 
 # 双绿灯合推：任何一步不成立都只写证据并 AUTO_MERGED=0，绝不 --force
 merge_and_push() {
-  local remote_base new_head parent_count
+  local remote_base new_head parent_count audited_task_paths
 
   echo "== merge attempt $(date -Is) ticket=$TICKET_ID" >> "$MERGE_LOG"
   echo "audited_base=$AUDITED_BASE audited_commit=$AUDITED_COMMIT base_branch=$BASE_BRANCH repo=$REPO_DIR" >> "$MERGE_LOG"
+
+  # 合入前闭锁：只认已审 SHA 的 tree，index/ignore 规则都不作数。
+  # 此阶段禁止 git rm / 新提交 / 改 SHA——发现问题只能拒合，留下 worktree 与证据。
+  if [[ "$(git -C "$WORKTREE_DIR" rev-parse HEAD)" != "$AUDITED_COMMIT" ]]; then
+    MERGE_REASON="post_audit_commit_changed"; return 1
+  fi
+  if ! audited_task_paths="$(git -C "$WORKTREE_DIR" ls-tree -r --name-only "$AUDITED_COMMIT" -- .task)"; then
+    MERGE_REASON="audited_tree_unreadable"; return 1
+  fi
+  if [[ -n "$audited_task_paths" ]]; then
+    MERGE_REASON="task_dir_in_audited_tree"
+    echo "audited tree still tracks .task:" >> "$MERGE_LOG"
+    echo "$audited_task_paths" >> "$MERGE_LOG"
+    return 1
+  fi
 
   if ! git -C "$REPO_DIR" fetch origin "$BASE_BRANCH" >> "$MERGE_LOG" 2>&1; then
     MERGE_REASON="fetch_failed"; return 1
@@ -245,11 +356,18 @@ if [[ "$PI_EXIT" -eq 0 ]]; then
   git -C "$WORKTREE_DIR" fetch origin "$BASE_BRANCH" >/dev/null 2>&1 || true
   AUDITED_BASE="$(git -C "$WORKTREE_DIR" rev-parse "refs/remotes/origin/$BASE_BRANCH" 2>/dev/null \
     || git -C "$WORKTREE_DIR" rev-parse "$BASE_BRANCH")"
+
+  # 审查前清理：先摘掉已 tracked 的 .task/ 再绑已审 SHA，审查指纹才对得上干净树
+  TIP_CLEAN=1
+  sanitize_audited_tip || TIP_CLEAN=0
+
   AUDITED_COMMIT="$(git -C "$WORKTREE_DIR" rev-parse HEAD)"
   COMMITS_AHEAD="$(git -C "$WORKTREE_DIR" rev-list --count "$AUDITED_BASE..$AUDITED_COMMIT" 2>/dev/null || echo 0)"
   STATE_AT_AUDIT="$(worktree_state)"
 
-  if worktree_dirty; then
+  if [[ "$TIP_CLEAN" -ne 1 ]]; then
+    echo "tip not clean: $AUDIT_REASON" >> "$MERGE_LOG"   # sanitize_audited_tip 已写入精确 reason
+  elif worktree_dirty; then
     AUDIT_VERDICT="FAIL"; AUDIT_REASON="dirty_worktree"
   elif [[ "$COMMITS_AHEAD" -lt 1 ]] && ! git -C "$WORKTREE_DIR" merge-base --is-ancestor "$AUDITED_COMMIT" "$AUDITED_BASE"; then
     # 例外：本分支已合入 base（重复执行），此时 commits_ahead=0 属正常幂等

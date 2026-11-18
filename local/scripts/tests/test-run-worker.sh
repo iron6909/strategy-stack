@@ -31,7 +31,7 @@ new_fixture() {
   export HOME="$ROOT/home"
   mkdir -p "$HOME/.harness/webhooks"
   printf '[user]\n\tname = Test\n\temail = test@example.invalid\n' > "$HOME/.gitconfig"
-  unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT
+  unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
 
   BIN="$ROOT/bin"
   mkdir -p "$BIN"
@@ -52,6 +52,20 @@ echo "proof line for ${STUB_PI:-ok}" > .task/evidence/proof.txt
 echo "feat-${STUB_PI:-ok}" >> feature.txt
 git add feature.txt
 git commit -qm "feat: stub work"
+# 模拟 agent 把 .task/ 证据入库（-f 绕过 info/exclude，正是本项目要防的场景）
+case "${STUB_PI_TASK:-}" in
+  tracked)
+    mkdir -p .task/evidence
+    echo "tracked proof" > .task/evidence/tracked-proof.txt
+    git add -f .task
+    git commit -qm "feat: stub work with tracked .task evidence" ;;
+  tracked_space)
+    mkdir -p ".task/evidence/proof dir"
+    echo "spaced proof" > ".task/evidence/proof dir/my proof.txt"
+    git add -f .task
+    git commit -qm "feat: stub work with tracked .task (spaced path)" ;;
+esac
+git rev-parse HEAD > "${STUB_SHA_OUT:-/dev/null}"
 PI
   cat > "$BIN/agy" <<'AGY'
 #!/usr/bin/env bash
@@ -69,6 +83,13 @@ case "${STUB_AGY:-pass}" in
     ( cd "$STUB_REPO" && echo base-moved > f.txt \
       && git commit -qam "base moved during audit" \
       && git push -q origin main ) ;;
+  treetask)
+    # 审计通过但已审 SHA 的 tree 里仍有 .task：只动 index + replace ref，不动 HEAD，
+    # 因此 post_audit_* 全部通过，只能靠合入前的 ls-tree 闭锁拦住（index/ignore 不作数）。
+    printf 'VERDICT: PASS\n[Consider] 无\n'
+    git add -f .task/evidence/proof.txt
+    repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with .task")"
+    git replace HEAD "$repl" ;;
   *) printf 'VERDICT: PASS\n[Act On] 无\n[Consider] 无\n[Dismissed] 无\n' ;;
 esac
 AGY
@@ -101,13 +122,14 @@ CURL
   PAYLOAD="$WORKTREE/.task/webhook-payload.json"
 }
 
-run_worker() {
+run_worker_at() {
   OUT="$(
-    bash "$SCRIPT" --repo "$REPO" --ticket "$TICKET" --prompt-file "$ROOT/prompt.md" 2>&1
+    bash "$SCRIPT" --repo "$1" --ticket "$TICKET" --prompt-file "$ROOT/prompt.md" 2>&1
   )"
   RC=$?
   DONE_LINE="$(printf '%s\n' "$OUT" | grep '^\[DONE\]' | tail -n1)"
 }
+run_worker() { run_worker_at "$REPO"; }
 
 done_field() { printf '%s\n' "$DONE_LINE" | grep -oE "$1=[^ ]*" | tail -n1 | cut -d= -f2-; }
 payload_field() { sed -n "s/^  \"$1\": *//p" "$PAYLOAD" | sed -e 's/,$//' -e 's/^"//' -e 's/"$//'; }
@@ -313,6 +335,117 @@ eq "二次执行识别已合并" "$(done_field merge_reason)" "already_merged"
 eq "未产生第二次合并提交" "$(remote_count)" "$FIRST_COUNT"
 eq "merge_commit 未漂移" "$(done_field merge_commit)" "$FIRST_SHA"
 eq "远端 tip 未漂移" "$(remote_main)" "$FIRST_SHA"
+
+# ---------------------------------------------------------------------------
+CASE="exclude_from_worktree_repo"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+# --repo 本身就是一个 worktree：common dir 仍必须解析到主仓，不能写进 worktree 的 .git
+# （worktree 的 .git 是文件，写错会直接失败）
+git -C "$REPO" worktree add -q "$ROOT/worktrees/host" -b host-branch main
+is_true "host 是 worktree（.git 为文件）" '[[ -f "$ROOT/worktrees/host/.git" ]]'
+run_worker_at "$ROOT/worktrees/host"
+HOST_EXCLUDE="$REPO/.git/info/exclude"
+eq "exit code" "$RC" "0"
+exists "主仓 info/exclude 被写入" "$HOST_EXCLUDE"
+eq ".task/ 已写入主仓 exclude" "$(grep -cxF '.task/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
+eq "out/ 已写入主仓 exclude" "$(grep -cxF 'out/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
+eq "projects/ 已写入主仓 exclude" "$(grep -cxF 'projects/' "$HOST_EXCLUDE" 2>/dev/null)" "1"
+exists "worktree 已建立" "$ROOT/worktrees/worktrees/$TICKET"
+
+# ---------------------------------------------------------------------------
+CASE="common_dir_relative_fallback"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+# 模拟旧 git：拒绝 --path-format，且 --git-common-dir 只给相对路径（须由脚本安全拼接）
+REAL_GIT="$(command -v git)"
+mkdir -p "$ROOT/bingit"
+cat > "$ROOT/bingit/git" <<GIT
+#!/usr/bin/env bash
+for a in "\$@"; do
+  if [[ "\$a" == --path-format=* ]]; then echo "error: unknown option" >&2; exit 129; fi
+done
+if [[ "\$*" == *--git-common-dir* ]]; then
+  repo="\$PWD"
+  if [[ "\$1" == "-C" ]]; then repo="\$2"; shift 2; fi
+  out="\$("$REAL_GIT" -C "\$repo" rev-parse --git-common-dir)" || exit \$?
+  [[ "\$out" == /* ]] && out="\$(realpath --relative-to="\$repo" "\$out")"
+  printf '%s\\n' "\$out"; exit 0
+fi
+exec "$REAL_GIT" "\$@"
+GIT
+chmod +x "$ROOT/bingit/git"
+export PATH="$ROOT/bingit:$PATH"
+run_worker
+eq "exit code" "$RC" "0"
+eq "回退路径下仍写对主仓 exclude" "$(grep -cxF '.task/' "$REPO/.git/info/exclude" 2>/dev/null)" "1"
+eq "回退路径下双绿灯仍成立" "$(done_field auto_merged)" "1"
+
+# ---------------------------------------------------------------------------
+CASE="tracked_task_removed_before_audit"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_PI_TASK=tracked STUB_AGY=pass STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+AUDITED="$(payload_field audited_commit)"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "dual green 合推" "$(done_field auto_merged)" "1"
+eq "merge reason" "$(done_field merge_reason)" "merged_and_pushed"
+is_true "已审 SHA 换成了不含 .task 的 tip" '[[ "$AUDITED" != "$PI_SHA" ]]'
+is_true "已审 tip 树无 .task" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --name-only "$AUDITED" -- .task)" ]]'
+is_true "远端 main 树无 .task" '[[ -z "$(git -C "$ROOT/remote.git" ls-tree -r --name-only refs/heads/main -- .task)" ]]'
+is_true "带 .task 的历史提交未进 main" '! git -C "$ROOT/remote.git" cat-file -e "$PI_SHA^{commit}" 2>/dev/null'
+is_true "main 上任何可达 tree 都无 .task" '[[ -z "$(for c in $(git -C "$ROOT/remote.git" rev-list refs/heads/main); do git -C "$ROOT/remote.git" ls-tree -r --name-only "$c" -- .task; done)" ]]'
+eq "历史被压成一个干净 tip（不留中间 .task 提交）" "$(remote_count)" "3"
+exists "证据文件仍在工作区（未被删）" "$WORKTREE/.task/evidence/tracked-proof.txt"
+echo "  proof: pi_sha=$PI_SHA audited=$AUDITED"
+
+# ---------------------------------------------------------------------------
+CASE="tracked_task_with_space_in_path"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_PI_TASK=tracked_space STUB_AGY=pass STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+AUDITED="$(payload_field audited_commit)"
+eq "dual green 合推" "$(done_field auto_merged)" "1"
+is_true "已审 tip 树无 .task（含空格路径）" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --name-only "$AUDITED" -- .task)" ]]'
+is_true "远端 main 树无 .task（含空格路径）" '[[ -z "$(git -C "$ROOT/remote.git" ls-tree -r --name-only refs/heads/main -- .task)" ]]'
+is_true "含空格 .task 提交未进 main" '! git -C "$ROOT/remote.git" cat-file -e "$PI_SHA^{commit}" 2>/dev/null'
+exists "含空格证据文件仍在工作区" "$WORKTREE/.task/evidence/proof dir/my proof.txt"
+
+# ---------------------------------------------------------------------------
+CASE="exclude_idempotent"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+run_worker
+export STUB_PI=none
+run_worker
+EXCLUDE="$REPO/.git/info/exclude"
+eq ".task/ 重复执行不重复写行" "$(grep -cxF '.task/' "$EXCLUDE")" "1"
+eq "out/ 重复执行不重复写行" "$(grep -cxF 'out/' "$EXCLUDE")" "1"
+eq "projects/ 重复执行不重复写行" "$(grep -cxF 'projects/' "$EXCLUDE")" "1"
+
+# ---------------------------------------------------------------------------
+CASE="merge_gate_task_dir_in_audited_tree"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=treetask STUB_SHA_OUT="$ROOT/pi.sha"
+run_worker
+PI_SHA="$(cat "$ROOT/pi.sha")"
+eq "审查本身通过" "$(done_field audit)" "PASS"
+eq "merge reason" "$(done_field merge_reason)" "task_dir_in_audited_tree"
+eq "auto_merged" "$(done_field auto_merged)" "0"
+eq "已审 SHA 未被改" "$(payload_field audited_commit)" "$PI_SHA"
+eq "未在合入阶段新造提交" "$(git -C "$WORKTREE" rev-parse HEAD)" "$PI_SHA"
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+exists "worktree 保留" "$WORKTREE"
+exists ".task 证据保留" "$WORKTREE/.task/evidence/proof.txt"
+match "合推日志记录拒合原因" "$(cat "$WORKTREE/.task/$TICKET-merge.txt" 2>/dev/null)" "task_dir_in_audited_tree|audited tree still tracks"
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
