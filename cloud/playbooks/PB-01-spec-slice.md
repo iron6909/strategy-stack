@@ -21,6 +21,11 @@
   1. **纵向贯穿**：每个子工单必须切穿真实可运行的一薄层（Schema + 逻辑 + 最小 UI/CLI + 测试）。
   2. **单窗容量**：改动规模必须能在一个全新的本地 `pi` 会话窗口内一次跑通。
   3. **显式阻塞边**：使用 Linear 原生 `Blocked by` 关系连接先后依赖。
+  4. **无需人工审批合入**：子单由本地双绿灯（`pi_exit == 0` + `agy` 审查首行 `VERDICT: PASS`）自动 `--no-ff` 合入 `main` 并推送，没有“Needs Approval 再合入”环节；父 Spec 由 Sirus 做终验，红线动作见 PB-02。
 
 - [ ] **Step 5: 写入五要素标准并激活首波工单 (`Attach 5-Element Criteria & Queue`)**
-  在每个子工单正文中写清 `Goal`、`Done Check`、`Proof`、`Known Info`、`Constraints`。将无前置阻塞的首波子工单状态设为 `states.mozi_eng["Queued"]`，有前置依赖的设为 `states.mozi_eng["Blocked"]`，在父 Spec 下汇总拆单拓扑报给 Sirus。
+  在每个子工单正文中写清 `Goal`、`Done Check`、`Proof`、`Known Info`、`Constraints`。将无前置阻塞的首波子工单状态设为 `states.mozi_eng["Queued"]`，有前置依赖的设为 `states.mozi_eng["Blocked"]`，在父 Spec 下汇总拆单拓扑报给 Sirus。每个子单须把改动提交在 `feat/<工单号>` 上（未提交改动会让审查门禁判 FAIL），合推成功后云端在同一回合解锁并派发下一个 `Queued` 子单。
+
+## 仓库政策
+
+本仓库只放规范与脚本。`~/court/` 整目录与 `/home/box/studio_rules.md` 一律不提交进本仓库；需要引用时只写「读取 `~/court/...`」这类运行时指令。
