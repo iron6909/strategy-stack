@@ -16,16 +16,18 @@
   - Tailscale 派单本地 Pi 与双绿灯自动合推 → `cloud/playbooks/PB-02-dispatch-pi.md`
   - 按需 X 情报聚类与 1–12 字短语草稿 → `cloud/playbooks/PB-03-x-micro-intel.md`
   - 每周垃圾回收、Linear 旧单归档与仓库进化审计 → `cloud/playbooks/PB-04-weekly-gc.md`
-  - MyMontage 视频创作与 Google Drive 分类归档 → `cloud/playbooks/PB-05-video-montage.md`
+  - OpenMontage 免侵入式视频创作与 Google Drive 归档（本地 `agy` 全权驱动，不走 pi / 二次审查 / worktree 合入） → `cloud/playbooks/PB-05-video-montage.md`
   - 120K Token 触发 `N世` 转世交接 → `cloud/skills/reincarnation.md`
   - 1–12 字中文短语与去 AI 味过滤 → `cloud/skills/unslop-cn.md`
 - **本地内环（Ubuntu Pi）**：
   - 垂直切片 TDD 实现 → `local/skills/implement-tdd.md`
   - 五步真实验证与二败回滚 → `local/skills/prove-it-works.md`
   - 本地 Gemini Pro (`agy -p`) 双轴只读审查 → `local/skills/local-cross-audit.md`
-  - 本地 MyMontage 视频调度、验片与 rclone 直传 Google Drive → `local/scripts/run-video-worker.sh`
+  - 本地 `agy` 驱动 OpenMontage、ffprobe 物理流校验与 rclone 直传 Google Drive → `local/scripts/run-video-worker.sh`
 
 ## 合推门禁（唯一标准）
+
+> 本门禁只适用于代码工程（PB-02 / `local/scripts/run-worker.sh`）。视频创作走 PB-05 / `local/scripts/run-video-worker.sh`：由本地 `agy` 驱动 OpenMontage 五层流水线，用内置质量门禁 + `ffprobe` 校验物理流，经 `rclone` 按领域或 `99_Temp_Test` 直传 Google Drive；**上传成功后工单直接标 `Done`**，不挂 `Needs Approval`，也不做 git 合入。
 
 1. `PI_EXIT == 0`：实施用 `pi --mode json ... < /dev/null` 正常退出，且改动已提交到 `feat/<工单号>`（留下未提交改动直接判 FAIL）。
 2. `AUDIT_VERDICT == PASS`：审查用 `agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m -p ... < /dev/null`，prompt 首句硬禁 bash/shell/文件工具，只喂 `.task/review-bundle.txt` 纯文本（任务书 + `.task/evidence/` 文本证据 + 文件清单 + 绑定已审 commit 的 `git diff`），报告首行必须恰为 `VERDICT: PASS`。

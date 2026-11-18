@@ -12,7 +12,7 @@
   通过 Tailscale 检查本地 Ubuntu：
   1. 清理 `~/work/worktrees/` 下对应 Linear 已 `Done` 超过 7 天的遗留工作树，释放 SSD 空间：只清 `auto_merged == 1` 的工单；`auto_merged == 0`（冲突、推送拒绝、基线变化、脏树）一律保留现场。清理前必须先把 `.task/` 证据（审查报告、review-bundle、合推日志、测试日志）复制到 worktree 之外的 `~/task-archive/<工单号>/`，且**禁止 `git worktree remove --force`**。
   2. 清理 Google Drive `99_Temp_Test/` 下超过 7 天的临时测试视频（经本地 `rclone` 删除，不经由云端中转）。
-  3. 清理本地 `MyMontage/jobs/` 下已完结工单的 `tmp/` 缓存，保留最终脚本与日志。
+  3. 清理本地 `MyMontage/projects/` 下已完结工单的 `tmp/` 缓存，保留最终脚本与日志。
 - [ ] **Step 4: 清理收尾 (`Quiet Termination`)**
   Step 1–5 均由韩非执行。Step 1–3 仅在归档了异常僵尸工单、发现超限成员（转交鬼谷交接）或清理了工作树/临时视频缓存时向 Sirus 发送简报；若无异常，安静结束回合。
 - [ ] **Step 5: Strategy-Stack 仓库进化审计 (`Evolve Strategy-Stack`)**

@@ -3,10 +3,9 @@ set -euo pipefail
 
 MONTAGE_DIR=""
 TICKET_ID=""
-CATEGORY="00_Uncategorized"
+CATEGORY="01_English_Drama"
 MODE="prod" # prod 或 test
 PROMPT_FILE=""
-RESUME_SESSION=""
 GDRIVE_REMOTE="${GDRIVE_REMOTE:-gdrive:MyMontage_Studio}"
 
 while [[ $# -gt 0 ]]; do
@@ -16,60 +15,65 @@ while [[ $# -gt 0 ]]; do
     --category) CATEGORY="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
-    --resume) RESUME_SESSION="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
 
 if [[ -z "$MONTAGE_DIR" || -z "$TICKET_ID" || -z "$PROMPT_FILE" ]]; then
-  echo "Usage: $0 --montage-dir <path> --ticket <MOZ-25> --category <Folder> --mode <prod|test> --prompt-file <path> [--resume <session_jsonl>]"
+  echo "Usage: $0 --montage-dir <path> --ticket <MOZ-30> --category <Folder> --mode <prod|test> --prompt-file <path>"
   exit 1
 fi
 
-# 0. 自动同步最新 strategy-stack 规则
+# 0. 无感拉取最新 strategy-stack 规则
 git -C "$HOME/strategy-stack" pull --ff-only >/dev/null 2>&1 || true
 
-# 1. 24G 内存与 2 并发硬门禁检查（与墨翟共享同一物理算力池）
-# 锚定完整命令词，避免 brave/grok/pipewire/acpi/napi 等含 "pi" 的无关进程被计入
-ACTIVE_JOBS=$(pgrep -fc '(^|/)(pi|agy|ffmpeg)( |$)' || true)
+# 1. 24G 内存与 2 并发硬门禁检查
+# 锚定完整命令词（MOZ-9）：避免 brave/grok/pipewire/acpi/napi 等含 "pi" 的无关进程被计入
+ACTIVE_JOBS=$(pgrep -fc '(^|/)(pi|agy|ffmpeg|remotion)( |$)' || true)
 FREE_MEM=$(free -m | awk '/^Mem:/{print $7}')
 if [[ "$ACTIVE_JOBS" -ge 2 ]] || [[ "$FREE_MEM" -lt 6000 ]]; then
   echo "[GATE_BLOCKED] active_jobs=$ACTIVE_JOBS, free_mem=${FREE_MEM}MB (<6000MB)"
   exit 2
 fi
 
-# 2. 创建独立任务沙箱目录（复用 MyMontage 主环境虚拟环境与插件，不重复拷贝大体积素材）
-JOB_DIR="$MONTAGE_DIR/jobs/$TICKET_ID"
-mkdir -p "$JOB_DIR/output" "$JOB_DIR/tmp" "$JOB_DIR/.task/sessions" "$JOB_DIR/.task/evidence"
-cp "$PROMPT_FILE" "$JOB_DIR/.task/$TICKET_ID-prompt.md"
+# 2. 创建免侵入式创作项目沙箱（绝不创建 git worktree，绝不改动框架源码）
+PROJECT_DIR="$MONTAGE_DIR/projects/$TICKET_ID"
+mkdir -p "$PROJECT_DIR/output" "$PROJECT_DIR/tmp" "$PROJECT_DIR/.task/evidence"
+cp "$PROMPT_FILE" "$PROJECT_DIR/.task/$TICKET_ID-brief.md"
 
-# 3. 启动 Pi 在 MyMontage 中执行剧本编写、TTS 与视频合成
+# 3. 启动 agy 全权操纵 OpenMontage 五层流水线（免批模式 + 闭合 Stdin 防止后台挂起）
 cd "$MONTAGE_DIR"
-EXEC_INSTRUCTION="你当前位于 MyMontage 根目录（$MONTAGE_DIR）。请严格在独立任务目录 $JOB_DIR 下组织本次视频创作的剧本、分镜与中间文件，并将最终合成的视频成片输出为 $JOB_DIR/output/final.mp4（若有字幕或封面请一并放入 $JOB_DIR/output/）。任务要求如下：
-$(cat "$JOB_DIR/.task/$TICKET_ID-prompt.md")"
+AGY_DIRECTIVE="你是 OpenMontage (MyMontage) 自主视频创作引擎统帅。当前位于仓库根目录（$MONTAGE_DIR）。
+请严格遵循 OpenMontage 五层架构（读取根目录 SKILL.md / AGENTS.md 入口契约、调用内置产线与 custom/ 扩展插件、使用 tools/ 注册表工具与 remotion-composer 渲染，并执行内置工程化质量门禁），全权完成本次视频创作任务。
+【免侵入式创作铁律】
+1. 严禁修改 MyMontage 任何现有框架源码或配置文件（保持 git status 干净）。
+2. 所有分镜脚本、TTS 音频、字幕与中间资产必须存放在独立项目目录：$PROJECT_DIR/。
+3. 最终合成通过内置质量门禁的视频成片必须输出至：$PROJECT_DIR/output/final.mp4（配套 .srt 字幕、封面图或分镜说明一并输出至 $PROJECT_DIR/output/）。
+
+=== 本次视频创作任务书 ===
+$(cat "$PROJECT_DIR/.task/$TICKET_ID-brief.md")"
+
+# 自动探测 agy 支持的免批参数（如 --yolo）并闭合标准输入
+AGY_FLAGS=""
+if agy --help 2>&1 | grep -q -- "--yolo"; then
+  AGY_FLAGS="--yolo"
+elif agy --help 2>&1 | grep -q -- "--dangerously-skip-permissions"; then
+  AGY_FLAGS="--dangerously-skip-permissions"
+fi
 
 set +e
-if [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
-  pi --session-dir "$JOB_DIR/.task/sessions" --session "$RESUME_SESSION" --mode json \
-     -p "$EXEC_INSTRUCTION" > "$JOB_DIR/.task/$TICKET_ID.jsonl" 2>&1
-else
-  pi --session-dir "$JOB_DIR/.task/sessions" --mode json \
-     -p "$EXEC_INSTRUCTION" > "$JOB_DIR/.task/$TICKET_ID.jsonl" 2>&1
-fi
-PI_EXIT=$?
+agy $AGY_FLAGS -p "$AGY_DIRECTIVE" < /dev/null > "$PROJECT_DIR/.task/$TICKET_ID-agy.log" 2>&1
+AGY_EXIT=$?
 set -e
 
-SES_FILE=$(ls -t "$JOB_DIR/.task/sessions/"*.jsonl 2>/dev/null | head -n 1 || echo "")
-FINAL_VIDEO="$JOB_DIR/output/final.mp4"
+FINAL_VIDEO="$PROJECT_DIR/output/final.mp4"
 PROBE_OK=0
-PROBE_SUMMARY="$JOB_DIR/.task/probe-summary.txt"
-AUDIT_FILE="$JOB_DIR/.task/$TICKET_ID-audit.md"
-AUDIT_VERDICT="SKIPPED"
+PROBE_SUMMARY="$PROJECT_DIR/.task/probe-summary.txt"
 GDRIVE_DEST="NOT_UPLOADED"
 GDRIVE_LINK="NONE"
 
-# 4. 视频硬指标检验 (ffprobe) 与三点抽帧取证 (15%, 50%, 85%)
-if [[ "$PI_EXIT" -eq 0 && -f "$FINAL_VIDEO" ]]; then
+# 4. 物理流完备性校验 (ffprobe) 与关键帧留档（无需二次 Agent 审批）
+if [[ "$AGY_EXIT" -eq 0 && -f "$FINAL_VIDEO" ]]; then
   DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$FINAL_VIDEO" 2>/dev/null || echo "0")
   STREAMS=$(ffprobe -v error -show_entries stream=codec_type,codec_name,width,height -of compact "$FINAL_VIDEO" 2>/dev/null || echo "")
   cat << PROB > "$PROBE_SUMMARY"
@@ -81,42 +85,15 @@ Streams:
 $STREAMS
 PROB
 
-  # 检查时长大于 1 秒且同时包含 video 和 audio 流
   if awk "BEGIN {exit !($DURATION > 1.0)}" && echo "$STREAMS" | grep -q "video" && echo "$STREAMS" | grep -q "audio"; then
     PROBE_OK=1
-    T1=$(awk "BEGIN {printf \"%.2f\", $DURATION * 0.15}")
-    T2=$(awk "BEGIN {printf \"%.2f\", $DURATION * 0.50}")
-    T3=$(awk "BEGIN {printf \"%.2f\", $DURATION * 0.85}")
-    ffmpeg -y -ss "$T1" -i "$FINAL_VIDEO" -frames:v 1 "$JOB_DIR/.task/evidence/frame_15pct.jpg" >/dev/null 2>&1 || true
-    ffmpeg -y -ss "$T2" -i "$FINAL_VIDEO" -frames:v 1 "$JOB_DIR/.task/evidence/frame_50pct.jpg" >/dev/null 2>&1 || true
-    ffmpeg -y -ss "$T3" -i "$FINAL_VIDEO" -frames:v 1 "$JOB_DIR/.task/evidence/frame_85pct.jpg" >/dev/null 2>&1 || true
+    T_MID=$(awk "BEGIN {printf \"%.2f\", $DURATION * 0.50}")
+    ffmpeg -y -ss "$T_MID" -i "$FINAL_VIDEO" -frames:v 1 "$PROJECT_DIR/output/cover_preview.jpg" >/dev/null 2>&1 || true
   fi
 fi
 
-# 5. 本地 Gemini Pro (agy -p) 双轴审片（核查剧本、字幕与音画指标）
-if [[ "$PROBE_OK" -eq 1 ]] && command -v agy >/dev/null 2>&1; then
-  OUTPUT_FILES=$(ls -lh "$JOB_DIR/output/" 2>/dev/null || echo "")
-  set +e
-  agy -p "你是独立只读视频质量审查官。请对照视频任务要求，检查生成的剧本/字幕文件、输出目录清单及 ffprobe 音画参数。首行必须输出 VERDICT: PASS 或 VERDICT: FAIL，随后按 [Act On]、[Consider]、[Dismissed] 输出精简审片报告：
-=== 任务要求 ===
-$(cat "$JOB_DIR/.task/$TICKET_ID-prompt.md")
-=== ffprobe 指标 ===
-$(cat "$PROBE_SUMMARY")
-=== 输出文件清单 ===
-$OUTPUT_FILES" > "$AUDIT_FILE" 2>&1
-  set -e
-
-  if grep -q "VERDICT: PASS" "$AUDIT_FILE"; then
-    AUDIT_VERDICT="PASS"
-  else
-    AUDIT_VERDICT="FAIL"
-  fi
-elif [[ "$PROBE_OK" -eq 1 ]]; then
-  AUDIT_VERDICT="PASS"
-fi
-
-# 6. 自动分类上传至 Google Drive（正式归入对应领域文件夹，测试强制归入 99_Temp_Test）
-if [[ "$PROBE_OK" -eq 1 && "$AUDIT_VERDICT" == "PASS" ]] && command -v rclone >/dev/null 2>&1; then
+# 5. 自动分类直传 Google Drive（正式片按领域归档，测试片强制入 99_Temp_Test）
+if [[ "$PROBE_OK" -eq 1 ]] && command -v rclone >/dev/null 2>&1; then
   DATE_PREFIX=$(date +%Y-%m-%d)
   if [[ "$MODE" == "test" ]]; then
     GDRIVE_DEST="$GDRIVE_REMOTE/99_Temp_Test/${DATE_PREFIX}_${TICKET_ID}"
@@ -124,20 +101,22 @@ if [[ "$PROBE_OK" -eq 1 && "$AUDIT_VERDICT" == "PASS" ]] && command -v rclone >/
     GDRIVE_DEST="$GDRIVE_REMOTE/${CATEGORY}/${DATE_PREFIX}_${TICKET_ID}"
   fi
 
-  if rclone copy "$JOB_DIR/output/" "$GDRIVE_DEST/" --include "*.mp4" --include "*.srt" --include "*.vtt" --include "*.jpg" --include "*.png" --include "*.md"; then
+  if rclone copy "$PROJECT_DIR/output/" "$GDRIVE_DEST/" --include "*.mp4" --include "*.srt" --include "*.vtt" --include "*.jpg" --include "*.png" --include "*.json" --include "*.md"; then
     GDRIVE_LINK=$(rclone link "$GDRIVE_DEST" 2>/dev/null || echo "$GDRIVE_DEST")
   else
     GDRIVE_DEST="UPLOAD_FAILED"
   fi
 fi
 
-# 7. 触发 Webhook 回调叫醒云端【公输 1世】
+# 6. 清理未压缩中间缓存并触发 Webhook 回调叫醒【公输 1世】
+rm -rf "$PROJECT_DIR/tmp" 2>/dev/null || true
+
 if [[ -f "$HOME/.harness/webhooks/gongshu.env" ]]; then
   set -a; . "$HOME/.harness/webhooks/gongshu.env"; set +a
   curl -s -X POST "$WEBHOOK_URL" \
     -H "Authorization: Bearer $WEBHOOK_KEY" \
     -H "Content-Type: application/json" \
-    -d "{\"ticket\": \"$TICKET_ID\", \"mode\": \"$MODE\", \"category\": \"$CATEGORY\", \"pi_exit\": $PI_EXIT, \"probe_ok\": $PROBE_OK, \"audit_verdict\": \"$AUDIT_VERDICT\", \"gdrive_dest\": \"$GDRIVE_DEST\", \"gdrive_link\": \"$GDRIVE_LINK\", \"job_dir\": \"$JOB_DIR\", \"session_file\": \"$SES_FILE\", \"audit_file\": \"$AUDIT_FILE\"}" >/dev/null 2>&1 || true
+    -d "{\"ticket\": \"$TICKET_ID\", \"mode\": \"$MODE\", \"category\": \"$CATEGORY\", \"agy_exit\": $AGY_EXIT, \"probe_ok\": $PROBE_OK, \"gdrive_dest\": \"$GDRIVE_DEST\", \"gdrive_link\": \"$GDRIVE_LINK\", \"project_dir\": \"$PROJECT_DIR\"}" >/dev/null 2>&1 || true
 fi
 
-echo "[DONE] ticket=$TICKET_ID mode=$MODE probe_ok=$PROBE_OK audit=$AUDIT_VERDICT gdrive=$GDRIVE_DEST"
+echo "[DONE] ticket=$TICKET_ID mode=$MODE agy_exit=$AGY_EXIT probe_ok=$PROBE_OK gdrive=$GDRIVE_DEST"
