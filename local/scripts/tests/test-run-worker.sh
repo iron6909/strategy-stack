@@ -34,6 +34,7 @@ new_fixture() {
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
   unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
   unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY NO_PROXY no_proxy
+  unset REVIEW_CLI MONTAGE_CLI STUB_PI_REVIEW STUB_REVIEW_CANARY OTHER_WORKTREE
   PROMPT_SRC=""
 
   BIN="$ROOT/bin"
@@ -44,6 +45,88 @@ new_fixture() {
 
   cat > "$BIN/pi" <<'PI'
 #!/usr/bin/env bash
+is_review=0
+for _a in "$@"; do
+  case "$_a" in --no-tools|-nt) is_review=1 ;; esac
+done
+_sidecar=""
+for _a in "$@"; do
+  if [[ "$_a" == @* && -e "${_a#@}" ]]; then
+    _sidecar="$(dirname "${_a#@}")"
+  fi
+done
+_log() {
+  printf '%s\n' "$1" >> "${STUB_LOG:-/dev/null}"
+  if [[ -n "$_sidecar" ]]; then
+    printf '%s\n' "$1" >> "$_sidecar/stub-review.log"
+  fi
+}
+if [[ "$is_review" -eq 1 ]]; then
+  _log "pi-review $*"
+  _log "env MOZ29_FAKE=${MOZ29_FAKE_KEY:-unset} MOZ29_KEEP=${MOZ29_KEEP_KEY:-unset}"
+  _log "proxy NO_PROXY=${NO_PROXY:-unset} no_proxy=${no_proxy:-unset}"
+  _stdin_tmp="$(mktemp -p "${_sidecar:-/tmp}" stdin.XXXXXX 2>/dev/null || mktemp)"
+  cat > "$_stdin_tmp"
+  if [[ -n "$_sidecar" ]]; then
+    wc -c < "$_stdin_tmp" | tr -d ' ' > "$_sidecar/review-stdin.bytes"
+  fi
+  rm -f "$_stdin_tmp"
+  for _a in "$@"; do
+    if [[ "$_a" == @* ]]; then
+      _f="${_a#@}"
+      if [[ -n "$_sidecar" && -f "$_f" ]]; then
+        wc -c < "$_f" | tr -d ' ' > "$_sidecar/review-argfile.bytes"
+        sha256sum "$_f" | cut -d' ' -f1 > "$_sidecar/review-argfile.sha"
+      fi
+    fi
+  done
+  case "${STUB_PI_REVIEW:-}" in
+    write)
+      printf 'pwned\n' > ./pwned-by-review.txt 2>/dev/null || true
+      printf 'pwned\n' > "${STUB_REVIEW_CANARY:-$HOME/pwned-by-review.txt}" 2>/dev/null || true
+      ;;
+  esac
+  _body=""
+  _rc=0
+  case "${STUB_AGY:-pass}" in
+    fail)  _body=$'VERDICT: FAIL\n[Act On] 缺真实证据\n' ;;
+    empty) _body="" ;;
+    fake)  _body=$'好的，我先说明一下审查口径。\nVERDICT: PASS\n[Act On] 无\n' ;;
+    late)  _body=$'VERDICT: PASS\n[Act On] 无\n'; _rc=4 ;;
+    postchange)
+      _body=$'VERDICT: PASS\n[Consider] 无\n'
+      echo tampered >> ./f.txt 2>/dev/null || true ;;
+    basepush)
+      _body=$'VERDICT: PASS\n[Consider] 无\n'
+      ( cd "$STUB_REPO" && echo base-moved > f.txt \
+        && git commit -qam "base moved during audit" \
+        && git push -q origin main ) 2>/dev/null || true ;;
+    treetask)
+      _body=$'VERDICT: PASS\n[Consider] 无\n'
+      git add -f .task/evidence/proof.txt
+      repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with .task")"
+      git replace HEAD "$repl" ;;
+    treeout)
+      _body=$'VERDICT: PASS\n[Consider] 无\n'
+      mkdir -p out
+      echo x > out/x.log
+      git add -f out
+      repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with out/")"
+      git replace HEAD "$repl" ;;
+    treeagents)
+      _body=$'VERDICT: PASS\n[Consider] 无\n'
+      echo cheat >> AGENTS.md
+      git add AGENTS.md
+      repl="$(git commit-tree "$(git write-tree)" -p HEAD -m "fake tree with root AGENTS.md change")"
+      git replace HEAD "$repl" ;;
+    *) _body=$'VERDICT: PASS\n[Act On] 无\n[Consider] 无\n[Dismissed] 无\n' ;;
+  esac
+  if [[ -n "$_body" && -n "$_sidecar" ]]; then
+    printf '%s' "$_body" > "$_sidecar/review-body.txt"
+    python3 -c 'import json,pathlib,sys; print(json.dumps({"text": pathlib.Path(sys.argv[1]).read_text()}))' "$_sidecar/review-body.txt"
+  fi
+  exit "$_rc"
+fi
 printf 'pi %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "${STUB_LOG:-/dev/null}"
 printf 'proxy NO_PROXY=%s no_proxy=%s\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >> "${STUB_LOG:-/dev/null}"
@@ -244,9 +327,28 @@ remote_count() { git -C "$ROOT/remote.git" rev-list --count refs/heads/main; }
 worktree_field() { git -C "$WORKTREE" "$@"; }
 agy_lines() { grep '^agy ' "$ROOT/stub.log" 2>/dev/null || true; }
 agy_argv_maxlen() { awk '/^agy /{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$ROOT/stub.log" 2>/dev/null; }
+review_lines() {
+  { cat "$WORKTREE/.task/review-argv.txt" 2>/dev/null || true
+    grep '^pi-review ' "$WORKTREE/.task/stub-review.log" 2>/dev/null || true
+  }
+}
+review_argv_maxlen() { awk '/^pi-review /{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$WORKTREE/.task/review-argv.txt" "$WORKTREE/.task/stub-review.log" 2>/dev/null; }
+count_impl_and_review() {
+  local pat="$1" n=0 c side
+  c=$(grep -cF "$pat" "$ROOT/stub.log" 2>/dev/null || true)
+  n=$((n + ${c:-0}))
+  for side in "$WORKTREE/.task/stub-review.log" "${OTHER_WORKTREE:-}/.task/stub-review.log"; do
+    [[ -f "$side" ]] || continue
+    c=$(grep -cF "$pat" "$side" || true)
+    n=$((n + ${c:-0}))
+  done
+  printf '%s' "$n"
+}
 
 CASE="bash -n"
 if bash -n "$SCRIPT" 2>/dev/null; then ok "run-worker.sh 语法"; else no "run-worker.sh 语法"; fi
+if bash -n "$HERE/../lib/review-cli.sh" 2>/dev/null; then ok "review-cli.sh 语法"; else no "review-cli.sh 语法"; fi
+if bash -n "$HERE/../run-video-worker.sh" 2>/dev/null; then ok "run-video-worker.sh 语法"; else no "run-video-worker.sh 语法"; fi
 if bash -n "${BASH_SOURCE[0]}" 2>/dev/null; then ok "测试脚本语法"; else no "测试脚本语法"; fi
 
 # ---------------------------------------------------------------------------
@@ -280,12 +382,16 @@ eq "payload merge_commit" "$(payload_field merge_commit)" "$MERGE_SHA"
 eq "payload evidence_dir 为持久目录" "$(payload_field evidence_dir)" "$HOME/task-archive/$TICKET"
 eq "webhook 投递体 auto_merged" "$(grep -oE '\"auto_merged\": [01]' "$ROOT/posted.json" 2>/dev/null)" '"auto_merged": 1'
 eq "payload 向后兼容字段 pi_exit" "$(payload_field pi_exit)" "0"
-match "agy 使用纯文本审查参数" "$(cat "$ROOT/stub.log" 2>/dev/null)" "dangerously-skip-permissions"
-match "agy 禁用 slash/skill 展开" "$(cat "$ROOT/stub.log" 2>/dev/null)" "disable-slash-commands"
+eq "payload engine 为 pi" "$(payload_field engine)" "pi"
 exists "审查 prompt 全文落盘" "$WORKTREE/.task/audit-prompt.txt"
-is_true "agy 不再用 -p 传 prompt" '[[ "$(agy_lines)" != *" -p "* ]]'
-eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
-eq "agy stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
+match "pi 审查禁用工具与会话" "$(review_lines)" "--no-tools"
+match "pi 审查 --no-session" "$(review_lines)" "--no-session"
+match "pi 审查 --mode json" "$(review_lines)" "--mode json"
+is_true "pi 审查用 @file 传 prompt" '[[ "$(review_lines)" == *" @"* ]]'
+eq "@file 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
+eq "@file 哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
+eq "审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
+is_true "pi 审查 argv 未塞进 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/stub-review.log"'
 
 # ---------------------------------------------------------------------------
 CASE="pi_failure"
@@ -339,7 +445,7 @@ printf '\n[%s]\n' "$CASE"
 new_fixture
 export STUB_PI=ok STUB_AGY=late
 run_worker
-eq "audit reason" "$(done_field audit_reason)" "agy_exit_4"
+eq "audit reason" "$(done_field audit_reason)" "review_exit_4"
 eq "auto_merged" "$(done_field auto_merged)" "0"
 eq "远端未变" "$(remote_main)" "$INIT_SHA"
 
@@ -401,7 +507,7 @@ absent "脏树不进入审查" "$WORKTREE/.task/$TICKET-audit.md"
 CASE="post_audit_change"
 printf '\n[%s]\n' "$CASE"
 new_fixture
-export STUB_PI=ok STUB_AGY=postchange
+export STUB_PI=ok STUB_AGY=postchange REVIEW_CLI=agy
 run_worker
 eq "audit verdict" "$(done_field audit)" "FAIL"
 eq "audit reason" "$(done_field audit_reason)" "post_audit_worktree_changed"
@@ -412,7 +518,7 @@ eq "远端未变" "$(remote_main)" "$INIT_SHA"
 CASE="base_changed_during_audit"
 printf '\n[%s]\n' "$CASE"
 new_fixture
-export STUB_PI=ok STUB_AGY=basepush STUB_REPO="$REPO"
+export STUB_PI=ok STUB_AGY=basepush STUB_REPO="$REPO" REVIEW_CLI=agy
 run_worker
 eq "audit verdict" "$(done_field audit)" "PASS"
 eq "merge reason" "$(done_field merge_reason)" "base_changed"
@@ -577,7 +683,7 @@ is_true "待审 tip 无 .pi/.task" '[[ -z "$(git -C "$WORKTREE" ls-tree -r --nam
 CASE="merge_gate_task_dir_in_audited_tree"
 printf '\n[%s]\n' "$CASE"
 new_fixture
-export STUB_PI=ok STUB_AGY=treetask STUB_SHA_OUT="$ROOT/pi.sha"
+export STUB_PI=ok STUB_AGY=treetask STUB_SHA_OUT="$ROOT/pi.sha" REVIEW_CLI=agy
 run_worker
 PI_SHA="$(cat "$ROOT/pi.sha")"
 eq "审查本身通过" "$(done_field audit)" "PASS"
@@ -605,15 +711,15 @@ big_bundle_case() {
   eq "$label: exit code" "$RC" "0"
   eq "$label: 审查通过" "$(done_field audit)" "PASS"
   eq "$label: 双绿灯合推" "$(done_field auto_merged)" "1"
-  is_true "$label: 送审 prompt 超过 128KiB 单参数上限（$total bytes）" '[[ "$(cat "$STUB_AGY_STDIN_BYTES")" -gt 131072 ]]'
-  eq "$label: agy 从 stdin 读满全部字节（无截断）" "$(cat "$STUB_AGY_STDIN_BYTES")" "$total"
-  eq "$label: stdin 内容哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$prompt_path" | cut -d' ' -f1)"
-  is_true "$label: agy argv 无 -p" '[[ "$(agy_lines)" != *" -p "* ]]'
-  is_true "$label: agy argv 长度 < 1KB" '[[ "$(agy_argv_maxlen)" -lt 1024 ]]'
-  match "$label: agy 用 --input-format text 读 stdin" "$(agy_lines)" "--input-format text"
-  is_true "$label: argv 未混入 bundle 正文" '! grep -q "REVIEW BUNDLE" "$ROOT/stub.log"'
-  printf '  proof: %s prompt=%s bytes stdin=%s bytes argv_max=%s bytes\n' \
-    "$label" "$total" "$(cat "$STUB_AGY_STDIN_BYTES")" "$(agy_argv_maxlen)"
+  is_true "$label: 送审 prompt 超过 128KiB 单参数上限（$total bytes）" '[[ "$(cat "$WORKTREE/.task/review-argfile.bytes")" -gt 131072 ]]'
+  eq "$label: @file 读满全部字节（无截断）" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$total"
+  eq "$label: @file 哈希与 prompt 文件一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$prompt_path" | cut -d' ' -f1)"
+  eq "$label: 审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
+  match "$label: pi 审查用 @file" "$(review_lines)" "@"
+  is_true "$label: pi-review argv 长度 < 4KB（指令短，正文在文件里）" '[[ "$(review_argv_maxlen)" -lt 4096 ]]'
+  is_true "$label: argv 未混入 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/stub-review.log"'
+  printf '  proof: %s prompt=%s bytes argfile=%s bytes argv_max=%s bytes\n' \
+    "$label" "$total" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(review_argv_maxlen)"
 }
 
 CASE="bundle_146k_audit_stdin"
@@ -649,8 +755,9 @@ eq "双绿灯合推" "$(done_field auto_merged)" "1"
 eq "merge reason" "$(done_field merge_reason)" "merged_and_pushed"
 eq "远端 tip == merge_commit" "$(done_field merge_commit)" "$(remote_main)"
 is_true "远端已含既有 tip" "git -C '$ROOT/remote.git' merge-base --is-ancestor '$TIP' refs/heads/main"
-eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$PROMPT_PATH")"
-eq "stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$PROMPT_PATH" | cut -d' ' -f1)"
+eq "@file 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(stat -c %s "$PROMPT_PATH")"
+eq "@file 哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$PROMPT_PATH" | cut -d' ' -f1)"
+eq "审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
 
 # ---------------------------------------------------------------------------
 CASE="audit_only_rejects_uncommitted_implementation"
@@ -670,7 +777,7 @@ eq "audit verdict" "$(done_field audit)" "FAIL"
 eq "audit reason" "$(done_field audit_reason)" "dirty_worktree"
 eq "auto_merged" "$(done_field auto_merged)" "0"
 eq "远端未变" "$(remote_main)" "$INIT_SHA"
-is_true "审查未启动" '[[ -z "$(agy_lines)" ]]'
+is_true "审查未启动" '[[ -z "$(agy_lines)" && -z "$(review_lines)" ]]'
 absent "脏树不写审查报告" "$WORKTREE/.task/$TICKET-audit.md"
 exists "worktree 保留" "$WORKTREE"
 
@@ -831,7 +938,7 @@ for mode in newroot upstreammod delroot rootagents; do
   match "$mode: upstream 侧也列出" "$(audit_body)" "\[Act On\] upstream:$expect"
   eq "$mode: auto_merged" "$(done_field auto_merged)" "0"
   eq "$mode: 远端未变" "$(remote_main)" "$INIT_SHA"
-  is_true "$mode: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+  is_true "$mode: 未启动审查引擎" '[[ -z "$(agy_lines)" && -z "$(review_lines)" ]]'
   is_true "$mode: 合推日志为空（未尝试合推）" '[[ ! -s "$WORKTREE/.task/$TICKET-merge.txt" ]]'
   exists "$mode: worktree 保留" "$WORKTREE"
   exists "$mode: 证据保留" "$WORKTREE/.task/evidence/proof.txt"
@@ -853,7 +960,7 @@ for mode in rmcharter symlinkcharter; do
   match "$mode: 列出宪章违规" "$(audit_body)" "$expect"
   eq "$mode: auto_merged" "$(done_field auto_merged)" "0"
   eq "$mode: 远端未变" "$(remote_main)" "$INIT_SHA"
-  is_true "$mode: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+  is_true "$mode: 未启动审查引擎" '[[ -z "$(agy_lines)" && -z "$(review_lines)" ]]'
 done
 
 # ---------------------------------------------------------------------------
@@ -911,7 +1018,7 @@ run_worker
 eq "缺失 remote: audit reason" "$(done_field audit_reason)" "custom_gate_upstream_ref_missing"
 eq "缺失 remote: auto_merged" "$(done_field auto_merged)" "0"
 eq "缺失 remote: 远端未变" "$(remote_main)" "$INIT_SHA"
-is_true "缺失 remote: 未启动 agy" '[[ -z "$(agy_lines)" ]]'
+is_true "缺失 remote: 未启动审查引擎" '[[ -z "$(agy_lines)" && -z "$(review_lines)" ]]'
 match "缺失 remote: audit 写明 reason" "$(audit_body)" 'upstream_ref_missing'
 # 2) URL 对了但从未 fetch 出 ref
 new_fixture
@@ -970,7 +1077,7 @@ printf '  proof: pi_sha=%s audited=%s\n' "$PI_SHA" "$AUDITED"
 CASE="custom_gate_merge_recheck_tree_lock"
 printf '\n[%s]\n' "$CASE"
 new_charter_fixture
-export STUB_PI=customonly STUB_AGY=treeout STUB_SHA_OUT="$ROOT/pi.sha"
+export STUB_PI=customonly STUB_AGY=treeout STUB_SHA_OUT="$ROOT/pi.sha" REVIEW_CLI=agy
 run_worker
 PI_SHA="$(cat "$ROOT/pi.sha")"
 eq "agy 侧审查通过" "$(done_field audit)" "PASS"
@@ -984,7 +1091,7 @@ match "合推日志记录运行目录" "$(cat "$WORKTREE/.task/$TICKET-merge.txt
 CASE="custom_gate_merge_recheck_gate"
 printf '\n[%s]\n' "$CASE"
 new_charter_fixture
-export STUB_PI=customonly STUB_AGY=treeagents STUB_SHA_OUT="$ROOT/pi.sha"
+export STUB_PI=customonly STUB_AGY=treeagents STUB_SHA_OUT="$ROOT/pi.sha" REVIEW_CLI=agy
 run_worker
 PI_SHA="$(cat "$ROOT/pi.sha")"
 eq "agy 侧审查通过" "$(done_field audit)" "PASS"
@@ -1011,7 +1118,7 @@ eq "exit code" "$RC" "0"
 eq "--audit-only 同样拦截" "$(done_field audit_reason)" "custom_gate_violation"
 eq "audit 首行恰为 VERDICT: FAIL" "$(audit_first_line)" "VERDICT: FAIL"
 match "列出 Makefile" "$(audit_body)" '\[Act On\] base:Makefile'
-is_true "未启动 agy" '[[ -z "$(agy_lines)" ]]'
+is_true "未启动审查引擎" '[[ -z "$(agy_lines)" && -z "$(review_lines)" ]]'
 eq "auto_merged" "$(done_field auto_merged)" "0"
 eq "远端未变" "$(remote_main)" "$INIT_SHA"
 exists "提示文件已生成" "$PROMPT_COPY_PATH"
@@ -1053,7 +1160,7 @@ EV="$WORKTREE/$EV_REL"
 eq "exit code" "$RC" "0"
 eq "审查通过" "$(done_field audit)" "PASS"
 eq "仍能双绿灯合推" "$(done_field auto_merged)" "1"
-eq "pi 与 agy 都看不到任何注入键" "$(grep -cxF 'env MOZ29_FAKE=unset MOZ29_KEEP=unset' "$ROOT/stub.log")" "2"
+eq "pi 实现与审查都看不到任何注入键" "$(count_impl_and_review 'env MOZ29_FAKE=unset MOZ29_KEEP=unset')" "2"
 eq "证据记录受信路径" "$(grep -cxF "path=$HOME/.harness/providers.env" "$EV")" "1"
 eq "证据记录 exists=0" "$(grep -cxF 'exists=0' "$EV")" "1"
 eq "证据记录 injected=0" "$(grep -cxF 'injected=0' "$EV")" "1"
@@ -1072,7 +1179,7 @@ printf 'MOZ29_DECOY_KEY=decoy\n' > "$REPO/providers.env"
 run_worker
 EV="$WORKTREE/$EV_REL"
 eq "exit code" "$RC" "0"
-eq "pi 与 agy 两个子进程都拿到假键" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset" "$ROOT/stub.log")" "2"
+eq "pi 实现与审查两个子进程都拿到假键" "$(count_impl_and_review "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset")" "2"
 eq "审查通过" "$(done_field audit)" "PASS"
 eq "双绿灯合推" "$(done_field auto_merged)" "1"
 eq "证据记录 exists=1" "$(grep -cxF 'exists=1' "$EV")" "1"
@@ -1096,7 +1203,7 @@ git -C "$REPO" worktree add -q "$ROOT/elsewhere/host" -b host-branch main
 run_worker_at "$ROOT/elsewhere/host"
 OTHER_WORKTREE="$ROOT/elsewhere/worktrees/$TICKET"
 eq "exit code" "$RC" "0"
-eq "worker 在独立 worktree 里仍注入" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset" "$ROOT/stub.log")" "2"
+eq "worker 在独立 worktree 里仍注入" "$(count_impl_and_review "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset")" "2"
 eq "证据落在该 worktree 的 .task/evidence" "$(grep -cxF 'exists=1' "$OTHER_WORKTREE/$EV_REL")" "1"
 eq "独立 worktree 仍双绿灯审查" "$(done_field audit)" "PASS"
 
@@ -1126,7 +1233,7 @@ mkdir -p "$HOME/.harness"
 printf 'MOZ29_KEEP_KEY=from-file\nMOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
 run_worker
 EV="$WORKTREE/$EV_REL"
-eq "pi 与 agy 都保留外层已有值" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=from-outer" "$ROOT/stub.log")" "2"
+eq "pi 实现与审查都保留外层已有值" "$(count_impl_and_review "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=from-outer")" "2"
 eq "证据记录 key:kept" "$(grep -cxF 'key=MOZ29_KEEP_KEY:kept' "$EV")" "1"
 eq "证据不记被保留变量的值" "$(grep -c from-outer "$EV")" "0"
 
@@ -1139,8 +1246,8 @@ export STUB_PI=ok STUB_AGY=pass
 printf 'MOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
 run_worker
 eq "exit code" "$RC" "0"
-eq "pi 与 agy 都拿到三个回环名（两个大小写变量同值）" \
-  "$(grep -cxF 'proxy NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1' "$ROOT/stub.log")" "2"
+eq "pi 实现与审查都拿到三个回环名（两个大小写变量同值）" \
+  "$(count_impl_and_review 'proxy NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1')" "2"
 
 CASE="no_proxy_keeps_existing"
 printf '\n[%s]\n' "$CASE"
@@ -1151,8 +1258,38 @@ printf 'no_proxy=.corp.example\n' > "$HOME/.harness/providers.env"
 run_worker
 unset NO_PROXY
 eq "外层大写条目与文件小写条目都保留，回环追加在后" \
-  "$(grep -cxF 'proxy NO_PROXY=api.corp.example,.corp.example,127.0.0.1,localhost,::1 no_proxy=api.corp.example,.corp.example,127.0.0.1,localhost,::1' "$ROOT/stub.log")" "2"
+  "$(count_impl_and_review 'proxy NO_PROXY=api.corp.example,.corp.example,127.0.0.1,localhost,::1 no_proxy=api.corp.example,.corp.example,127.0.0.1,localhost,::1')" "2"
 eq "证据不记 NO_PROXY 的值" "$(grep -c 'corp.example' "$WORKTREE/$EV_REL")" "0"
+
+# ---------------------------------------------------------------------------
+# MOZ-41：默认 pi 审查的写禁与 agy 回退路径
+CASE="review_sandbox_blocks_write"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass STUB_PI_REVIEW=write
+export STUB_REVIEW_CANARY="$ROOT/pwned-by-review.txt"
+run_worker
+eq "exit code" "$RC" "0"
+eq "审查仍可通过（写失败不得冒充工具成功）" "$(done_field audit)" "PASS"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+absent "审查进程写不进 worktree" "$WORKTREE/pwned-by-review.txt"
+absent "审查进程写不进 jail 外 canary" "$ROOT/pwned-by-review.txt"
+match "审查调用了 --no-tools" "$(review_lines)" "--no-tools"
+
+CASE="review_cli_agy_fallback"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass REVIEW_CLI=agy
+export STUB_AGY_STDIN_BYTES="$ROOT/stdin.bytes" STUB_AGY_STDIN_SHA="$ROOT/stdin.sha"
+run_worker
+eq "exit code" "$RC" "0"
+eq "agy 回退审查通过" "$(done_field audit)" "PASS"
+eq "payload engine 为 agy" "$(payload_field engine)" "agy"
+match "agy 使用纯文本审查参数" "$(cat "$ROOT/stub.log" 2>/dev/null)" "dangerously-skip-permissions"
+is_true "agy 不再用 -p 传 prompt" '[[ "$(agy_lines)" != *" -p "* ]]'
+eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
+eq "agy stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
+is_true "本用例未走 pi 审查" '[[ -z "$(review_lines)" ]]'
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
