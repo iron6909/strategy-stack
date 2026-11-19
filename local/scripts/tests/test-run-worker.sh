@@ -1403,6 +1403,43 @@ MONTAGE_CLI=agy
 eq "MONTAGE_CLI=agy 仍可显式回退" "$(review_cli_name_for_montage)" "agy"
 unset MONTAGE_CLI REVIEW_CLI
 
+
+CASE="codex_review_output_skips_symlink"
+printf '\n[%s]\n' "$CASE"
+# shellcheck source=../lib/review-cli.sh
+. "$HERE/../lib/review-cli.sh"
+_sy="$(mktemp -d)"
+printf 'untouched\n' > "$_sy/canary-last.txt"
+printf 'untouched\n' > "$_sy/canary-json.txt"
+printf 'untouched\n' > "$_sy/canary-empty.txt"
+printf 'untouched\n' > "$_sy/canary-meta.txt"
+printf 'VERDICT: PASS\n[Act On] 无\n' > "$_sy/last.txt"
+printf '%s\n' '{"text":"VERDICT: FAIL\n[Act On] from json\n"}' > "$_sy/stream.jsonl"
+: > "$_sy/empty.src"
+ln -s "$_sy/canary-last.txt" "$_sy/out-last.md"
+ln -s "$_sy/canary-json.txt" "$_sy/out-json.md"
+ln -s "$_sy/canary-empty.txt" "$_sy/out-empty.md"
+ln -s "$_sy/canary-meta.txt" "$_sy/review-argfile.bytes"
+# last-message / json-extract / empty / sidecar must all refuse to follow
+install_nofollow "$_sy/last.txt" "$_sy/out-last.md"; eq "last-message 遇 symlink 返回 91" "$?" "91"
+extract_review_text "$_sy/stream.jsonl" "$_sy/staged.txt" >/dev/null
+install_nofollow "$_sy/staged.txt" "$_sy/out-json.md"; eq "JSON 回退安装遇 symlink 返回 91" "$?" "91"
+truncate_nofollow "$_sy/out-empty.md"; eq "空输出遇 symlink 返回 91" "$?" "91"
+install_nofollow "$_sy/empty.src" "$_sy/review-argfile.bytes"; eq "sidecar 遇 symlink 返回 91" "$?" "91"
+eq "last canary 未被覆盖" "$(cat "$_sy/canary-last.txt")" "untouched"
+eq "json canary 未被覆盖" "$(cat "$_sy/canary-json.txt")" "untouched"
+eq "empty canary 未被覆盖" "$(cat "$_sy/canary-empty.txt")" "untouched"
+eq "sidecar canary 未被覆盖" "$(cat "$_sy/canary-meta.txt")" "untouched"
+# regular dest still works
+extract_review_text "$_sy/stream.jsonl" "$_sy/regular.md" >/dev/null
+eq "常规文件 JSON 提取仍可用" "$(sed -n '1p' "$_sy/regular.md")" "VERDICT: FAIL"
+# extract itself must also refuse a symlink dest
+extract_review_text "$_sy/stream.jsonl" "$_sy/out-json.md" >/dev/null
+eq "extract 直接写 symlink 返回 91" "$?" "91"
+eq "extract 直接写未改 canary" "$(cat "$_sy/canary-json.txt")" "untouched"
+rm -rf "$_sy"
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
 if [[ "$FAILED" -gt 0 ]]; then

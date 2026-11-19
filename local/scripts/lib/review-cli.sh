@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Independent read-only review helpers for run-worker.sh (t40 / MOZ-41).
-# REVIEW_CLI=pi (default) or agy. Never prints secrets.
-# pi review: fresh process, --no-session, --no-tools, no large argv,
-# OS-level write jail via bwrap when available.
+# Independent read-only review helpers for run-worker.sh (MOZ-41).
+# Default REVIEW_CLI/MONTAGE_CLI/WORKER_CLI is codex; pi and agy are
+# explicit fallbacks. Never prints secrets.
+# Codex review: fresh process, --sandbox read-only --ephemeral, no bypass,
+# prompt from stdin to EOF. Parent installs audit outputs with O_NOFOLLOW.
+# pi review fallback: --no-session, --no-tools, bwrap write jail when available.
 
 review_cli_name() {
   local raw="${REVIEW_CLI:-codex}"
@@ -13,7 +15,7 @@ review_cli_name() {
   esac
 }
 
-# Video worker engine switch. Default is always pi; MONTAGE_CLI does not
+# Video worker engine switch. Default is always codex; MONTAGE_CLI does not
 # inherit REVIEW_CLI (so REVIEW_CLI=agy cannot silently switch montage).
 review_cli_name_for_montage() {
   local raw="${MONTAGE_CLI:-codex}"
@@ -29,11 +31,20 @@ review_cli_name_for_montage() {
 extract_review_text() {
   local src="$1" dest="$2"
   python3 - "$src" "$dest" <<'PYEXTRACT'
-import json, sys
+import errno, json, os, sys
 from pathlib import Path
 
 src, dest = Path(sys.argv[1]), Path(sys.argv[2])
 raw = src.read_text(encoding="utf-8", errors="replace")
+
+def write_nofollow(path, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, 0o644)
+    except OSError as e:
+        sys.exit(91 if e.errno == errno.ELOOP else 1)
+    with os.fdopen(fd, "wb") as out:
+        out.write(data)
 
 def first_string(obj, prefer=()):
     if isinstance(obj, str) and obj.strip():
@@ -128,10 +139,11 @@ if text.startswith("\ufeff"):
     text = text[1:]
 # Whitespace-only reports must stay size-0 so the worker can use empty_report.
 if not text.strip():
-    dest.write_text("", encoding="utf-8")
+    write_nofollow(str(dest), b"")
     sys.stdout.write("")
 else:
-    dest.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+    payload = text if text.endswith("\n") else text + "\n"
+    write_nofollow(str(dest), payload.encode("utf-8"))
     first = text.splitlines()[0].replace("\r", "").rstrip()
     sys.stdout.write(first)
 PYEXTRACT
@@ -236,21 +248,35 @@ run_agy_review() {
 
 # Copy src onto dest using O_NOFOLLOW (will not write through a symlink dest).
 install_nofollow() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" <<'NFCOPY'
 import errno, os, sys
 src, dest = sys.argv[1], sys.argv[2]
 flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
 try:
     fd = os.open(dest, flags, 0o644)
 except OSError as e:
-    sys.exit(91 if e.errno in (errno.ELOOP, getattr(errno, "ELOOP", errno.EPERM)) else 1)
+    sys.exit(91 if e.errno == errno.ELOOP else 1)
 with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
     while True:
         chunk = inp.read(1024 * 1024)
         if not chunk:
             break
         out.write(chunk)
-PY
+NFCOPY
+}
+
+# Create or truncate dest as a regular file; never follow a symlink.
+truncate_nofollow() {
+  python3 - "$1" <<'NFTRUNC'
+import errno, os, sys
+dest = sys.argv[1]
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+try:
+    fd = os.open(dest, flags, 0o644)
+except OSError as e:
+    sys.exit(91 if e.errno == errno.ELOOP else 1)
+os.close(fd)
+NFTRUNC
 }
 
 worker_cli_name() {
@@ -304,18 +330,27 @@ run_codex_review() {
   bin="$(command -v codex)" || return 127
   [[ -f "$prompt_file" ]] || return 2
   mkdir -p "$allowed_dir"
-  {
-    wc -c < "$prompt_file" | tr -d " " > "$allowed_dir/review-argfile.bytes"
-    sha256sum "$prompt_file" | cut -d" " -f1 > "$allowed_dir/review-argfile.sha"
-    wc -c < "$prompt_file" | tr -d " " > "$allowed_dir/review-stdin.bytes"
-    printf 'codex-review exec --sandbox read-only --ephemeral --color never -C %s --output-last-message <stdin-file> -\n' \
-      "$worktree_dir" > "$allowed_dir/review-argv.txt"
-  } 2>/dev/null || true
 
   local priv
   priv="$(mktemp -d "${TMPDIR:-/var/tmp}/codex-audit-out.XXXXXX")"
   local priv_last="$priv/last.txt" priv_json="$priv/out.jsonl" priv_err="$priv/err.txt"
-  : > "$priv_last" ; : > "$priv_json" ; : > "$priv_err"
+  local priv_extracted="$priv/extracted.txt" priv_meta="$priv/sidecars"
+  : > "$priv_last" ; : > "$priv_json" ; : > "$priv_err" ; : > "$priv_extracted"
+  mkdir -p "$priv_meta"
+  # Sidecars are staged privately, then installed with O_NOFOLLOW so a
+  # pre-existing symlink in $allowed_dir cannot be followed by the parent.
+  wc -c < "$prompt_file" | tr -d " " > "$priv_meta/review-argfile.bytes"
+  sha256sum "$prompt_file" | cut -d" " -f1 > "$priv_meta/review-argfile.sha"
+  wc -c < "$prompt_file" | tr -d " " > "$priv_meta/review-stdin.bytes"
+  printf 'codex-review exec --sandbox read-only --ephemeral --color never -C %s --output-last-message <stdin-file> -\n' \
+    "$worktree_dir" > "$priv_meta/review-argv.txt"
+  local side
+  for side in review-argfile.bytes review-argfile.sha review-stdin.bytes review-argv.txt; do
+    if ! install_nofollow "$priv_meta/$side" "$allowed_dir/$side"; then
+      rm -rf "$priv" 2>/dev/null || true
+      return 91
+    fi
+  done
 
   local -a timeout_cmd=()
   if command -v timeout >/dev/null 2>&1; then
@@ -334,15 +369,18 @@ run_codex_review() {
   if [[ -s "$priv_last" ]]; then
     install_nofollow "$priv_last" "$out_file" || rc=91
   elif [[ -s "$priv_json" ]]; then
-    extract_review_text "$priv_json" "$out_file" >/dev/null || true
-    if [[ ! -s "$out_file" ]]; then
+    # Never let extract_review_text open $out_file directly; stage then install.
+    extract_review_text "$priv_json" "$priv_extracted" >/dev/null || true
+    if ! install_nofollow "$priv_extracted" "$out_file"; then
+      rc=91
+    elif [[ ! -s "$out_file" ]]; then
       rc="${rc:-1}"
     fi
   else
-    : > "$out_file"
+    truncate_nofollow "$out_file" || rc=91
   fi
-  install_nofollow "$priv_json" "$out_file.raw" 2>/dev/null || true
-  install_nofollow "$priv_err" "$err_file" 2>/dev/null || true
+  install_nofollow "$priv_json" "$out_file.raw" || { [[ "$rc" -eq 0 ]] && rc=91; }
+  install_nofollow "$priv_err" "$err_file" || { [[ "$rc" -eq 0 ]] && rc=91; }
   rm -rf "$priv" 2>/dev/null || true
   return "$rc"
 }
