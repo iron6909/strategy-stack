@@ -4,6 +4,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/providers-env.sh
 . "$SCRIPT_DIR/lib/providers-env.sh"
+. "$SCRIPT_DIR/lib/desktop-env.sh"
+
+# 回环绕行兜底（MOZ-36 baseline, integrated here so this branch does not
+# merge the unreviewed feat/MOZ-36 commit). Existing hosts kept; both spellings set.
+merge_no_proxy_loopback() {
+  local merged="" raw entry
+  local -a parts=()
+  local -A seen=()
+  for raw in "${NO_PROXY-}" "${no_proxy-}" '127.0.0.1,localhost,::1'; do
+    [[ -n "$raw" ]] || continue
+    IFS=',' read -r -a parts <<< "$raw"
+    for entry in "${parts[@]}"; do
+      entry="${entry//[[:space:]]/}"
+      [[ -n "$entry" && -z "${seen[$entry]-}" ]] || continue
+      seen[$entry]=1
+      merged="${merged:+$merged,}$entry"
+    done
+  done
+  export NO_PROXY="$merged" no_proxy="$merged"
+}
+
 
 MONTAGE_DIR=""
 TICKET_ID=""
@@ -51,6 +72,8 @@ inject_providers_env "$PROJECT_DIR/.task/evidence/providers-env.txt" || {
   echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
   exit 5
 }
+merge_no_proxy_loopback
+load_desktop_session_env
 
 # 3. 启动 agy 全权操纵 OpenMontage 五层流水线（免批模式 + 闭合 Stdin 防止后台挂起）
 cd "$MONTAGE_DIR"

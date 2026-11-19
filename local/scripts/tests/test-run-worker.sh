@@ -33,7 +33,7 @@ new_fixture() {
   printf '[user]\n\tname = Test\n\temail = test@example.invalid\n' > "$HOME/.gitconfig"
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
   unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
-  unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY
+  unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY NO_PROXY no_proxy
   PROMPT_SRC=""
 
   BIN="$ROOT/bin"
@@ -46,6 +46,7 @@ new_fixture() {
 #!/usr/bin/env bash
 printf 'pi %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "${STUB_LOG:-/dev/null}"
+printf 'proxy NO_PROXY=%s no_proxy=%s\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >> "${STUB_LOG:-/dev/null}"
 CUSTOMONLY=0
 case "${STUB_PI:-ok}" in
   fail)  exit 7 ;;
@@ -145,6 +146,7 @@ PI
 #!/usr/bin/env bash
 printf 'agy %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "${STUB_LOG:-/dev/null}"
+printf 'proxy NO_PROXY=%s no_proxy=%s\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >> "${STUB_LOG:-/dev/null}"
 # 必须读满 stdin 到 EOF：用例拿字节数与哈希断言「送审内容未截断」
 STDIN_TMP="$(mktemp)"
 cat > "$STDIN_TMP"
@@ -1127,6 +1129,30 @@ EV="$WORKTREE/$EV_REL"
 eq "pi 与 agy 都保留外层已有值" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=from-outer" "$ROOT/stub.log")" "2"
 eq "证据记录 key:kept" "$(grep -cxF 'key=MOZ29_KEEP_KEY:kept' "$EV")" "1"
 eq "证据不记被保留变量的值" "$(grep -c from-outer "$EV")" "0"
+
+# ---------------------------------------------------------------------------
+# MOZ-36：注入后合并 NO_PROXY / no_proxy，pi 与 agy 都拿到回环绕行，已有绕行主机不丢
+CASE="no_proxy_loopback_added"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+printf 'MOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+run_worker
+eq "exit code" "$RC" "0"
+eq "pi 与 agy 都拿到三个回环名（两个大小写变量同值）" \
+  "$(grep -cxF 'proxy NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1' "$ROOT/stub.log")" "2"
+
+CASE="no_proxy_keeps_existing"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass NO_PROXY="api.corp.example"
+# 文件只设小写变量，外层环境只设大写变量：合并后两个变量都要拿到全部条目
+printf 'no_proxy=.corp.example\n' > "$HOME/.harness/providers.env"
+run_worker
+unset NO_PROXY
+eq "外层大写条目与文件小写条目都保留，回环追加在后" \
+  "$(grep -cxF 'proxy NO_PROXY=api.corp.example,.corp.example,127.0.0.1,localhost,::1 no_proxy=api.corp.example,.corp.example,127.0.0.1,localhost,::1' "$ROOT/stub.log")" "2"
+eq "证据不记 NO_PROXY 的值" "$(grep -c 'corp.example' "$WORKTREE/$EV_REL")" "0"
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"

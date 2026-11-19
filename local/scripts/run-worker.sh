@@ -6,6 +6,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/providers-env.sh
 . "$SCRIPT_DIR/lib/providers-env.sh"
+. "$SCRIPT_DIR/lib/desktop-env.sh"
+
+# 回环绕行兜底（MOZ-36 baseline, integrated here so this branch does not
+# merge the unreviewed feat/MOZ-36 commit). Existing hosts kept; both spellings set.
+merge_no_proxy_loopback() {
+  local merged="" raw entry
+  local -a parts=()
+  local -A seen=()
+  for raw in "${NO_PROXY-}" "${no_proxy-}" '127.0.0.1,localhost,::1'; do
+    [[ -n "$raw" ]] || continue
+    IFS=',' read -r -a parts <<< "$raw"
+    for entry in "${parts[@]}"; do
+      entry="${entry//[[:space:]]/}"
+      [[ -n "$entry" && -z "${seen[$entry]-}" ]] || continue
+      seen[$entry]=1
+      merged="${merged:+$merged,}$entry"
+    done
+  done
+  export NO_PROXY="$merged" no_proxy="$merged"
+}
+
 
 REPO_DIR=""
 TICKET_ID=""
@@ -209,6 +230,8 @@ inject_providers_env "$EVIDENCE_DIR/providers-env.txt" || {
   echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
   exit 5
 }
+merge_no_proxy_loopback
+load_desktop_session_env
 
 # 4. 无头运行 Pi Coding Agent（挂载 OpenCode Go 高配额模型，stdin 必须闭合）
 cd "$WORKTREE_DIR"
