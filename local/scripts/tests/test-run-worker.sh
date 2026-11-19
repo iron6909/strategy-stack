@@ -1440,6 +1440,122 @@ eq "extract 直接写未改 canary" "$(cat "$_sy/canary-json.txt")" "untouched"
 rm -rf "$_sy"
 
 # ---------------------------------------------------------------------------
+
+CASE="codex_run_codex_review_branches_skip_symlink"
+printf '\n[%s]\n' "$CASE"
+# shellcheck source=../lib/review-cli.sh
+. "$HERE/../lib/review-cli.sh"
+_br="$(mktemp -d)"
+mkdir -p "$_br/bin" "$_br/work" "$_br/allowed" "$_br/prompt"
+printf 'review please\n' > "$_br/prompt/audit-prompt.txt"
+cat > "$_br/bin/codex" <<'STUB'
+#!/usr/bin/env bash
+last=""
+prev=""
+for a in "$@"; do
+  if [[ "$prev" == "--output-last-message" ]]; then last="$a"; fi
+  prev="$a"
+done
+cat >/dev/null
+case "${STUB_CODEX_REVIEW:-last}" in
+  last)
+    [[ -n "$last" ]] && printf 'VERDICT: PASS\n[Act On] 无\n' > "$last"
+    printf '{"text":"ignored last-path json"}\n'
+    printf 'review-stderr-last\n' >&2
+    exit 0
+    ;;
+  json)
+    [[ -n "$last" ]] && : > "$last"
+    printf '%s\n' '{"text":"VERDICT: FAIL\n[Act On] from json fallback\n"}'
+    printf 'review-stderr-json\n' >&2
+    exit 0
+    ;;
+  empty)
+    [[ -n "$last" ]] && : > "$last"
+    exit 0
+    ;;
+  last_nonzero)
+    [[ -n "$last" ]] && printf 'VERDICT: PASS\n' > "$last"
+    printf '{"text":"x"}\n'
+    printf 'review-stderr-nonzero\n' >&2
+    exit 4
+    ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$_br/bin/codex"
+export PATH="$_br/bin:$PATH"
+prompt="$_br/prompt/audit-prompt.txt"
+
+run_branch() {
+  local mode="$1" out="$2" err="$3" allowed="$4"
+  rm -rf "$allowed"
+  mkdir -p "$allowed"
+  STUB_CODEX_REVIEW="$mode" run_codex_review "$prompt" "$out" "$_br/work" "$allowed" "$err"
+}
+
+# --- last-message dest is a symlink ---
+printf 'untouched\n' > "$_br/canary-last.txt"
+ln -s "$_br/canary-last.txt" "$_br/out-last.md"
+run_branch last "$_br/out-last.md" "$_br/err-last.txt" "$_br/allowed-last"
+eq "run last-message symlink 返回 91" "$?" "91"
+eq "run last-message canary 未被覆盖" "$(cat "$_br/canary-last.txt")" "untouched"
+
+# --- JSON fallback dest is a symlink (empty last, non-empty json) ---
+printf 'untouched\n' > "$_br/canary-json.txt"
+ln -s "$_br/canary-json.txt" "$_br/out-json.md"
+run_branch json "$_br/out-json.md" "$_br/err-json.txt" "$_br/allowed-json"
+eq "run JSON 回退 symlink 返回 91" "$?" "91"
+eq "run JSON canary 未被覆盖" "$(cat "$_br/canary-json.txt")" "untouched"
+
+# --- empty output dest is a symlink ---
+printf 'untouched\n' > "$_br/canary-empty.txt"
+ln -s "$_br/canary-empty.txt" "$_br/out-empty.md"
+run_branch empty "$_br/out-empty.md" "$_br/err-empty.txt" "$_br/allowed-empty"
+eq "run 空输出 symlink 返回 91" "$?" "91"
+eq "run 空输出 canary 未被覆盖" "$(cat "$_br/canary-empty.txt")" "untouched"
+
+# --- sidecar in allowed_dir is a symlink (fails before/at install, no follow) ---
+printf 'untouched\n' > "$_br/canary-side.txt"
+mkdir -p "$_br/allowed-side"
+ln -s "$_br/canary-side.txt" "$_br/allowed-side/review-argv.txt"
+STUB_CODEX_REVIEW=last run_codex_review "$prompt" "$_br/out-side.md" "$_br/work" "$_br/allowed-side" "$_br/err-side.txt"
+eq "run sidecar symlink 返回 91" "$?" "91"
+eq "run sidecar canary 未被覆盖" "$(cat "$_br/canary-side.txt")" "untouched"
+
+# --- raw dest is a symlink; Codex already exited 4; must still be 91, canary intact ---
+printf 'untouched\n' > "$_br/canary-raw.txt"
+mkdir -p "$_br/allowed-raw"
+ln -s "$_br/canary-raw.txt" "$_br/ok-raw.md.raw"
+STUB_CODEX_REVIEW=last_nonzero run_codex_review "$prompt" "$_br/ok-raw.md" "$_br/work" "$_br/allowed-raw" "$_br/err-raw.txt"
+eq "run raw symlink 在 Codex 非零时仍返回 91" "$?" "91"
+eq "run raw canary 未被覆盖" "$(cat "$_br/canary-raw.txt")" "untouched"
+
+# --- stderr dest is a symlink; Codex already exited 4; must still be 91 ---
+printf 'untouched\n' > "$_br/canary-err.txt"
+mkdir -p "$_br/allowed-err"
+ln -s "$_br/canary-err.txt" "$_br/err-link.txt"
+STUB_CODEX_REVIEW=last_nonzero run_codex_review "$prompt" "$_br/ok-err.md" "$_br/work" "$_br/allowed-err" "$_br/err-link.txt"
+eq "run stderr symlink 在 Codex 非零时仍返回 91" "$?" "91"
+eq "run stderr canary 未被覆盖" "$(cat "$_br/canary-err.txt")" "untouched"
+
+# --- regular dests still work via last-message ---
+mkdir -p "$_br/allowed-ok"
+STUB_CODEX_REVIEW=last run_codex_review "$prompt" "$_br/ok.md" "$_br/work" "$_br/allowed-ok" "$_br/ok.err"
+eq "run 常规 last-message 退出 0" "$?" "0"
+eq "run 常规 last-message 首行" "$(sed -n '1p' "$_br/ok.md")" "VERDICT: PASS"
+exists "run 常规 sidecar argv" "$_br/allowed-ok/review-argv.txt"
+
+# --- regular dests work via JSON fallback ---
+mkdir -p "$_br/allowed-okj"
+STUB_CODEX_REVIEW=json run_codex_review "$prompt" "$_br/okj.md" "$_br/work" "$_br/allowed-okj" "$_br/okj.err"
+eq "run 常规 JSON 回退退出 0" "$?" "0"
+eq "run 常规 JSON 回退首行" "$(sed -n '1p' "$_br/okj.md")" "VERDICT: FAIL"
+
+rm -rf "$_br"
+unset STUB_CODEX_REVIEW
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
 if [[ "$FAILED" -gt 0 ]]; then

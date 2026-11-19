@@ -379,8 +379,10 @@ run_codex_review() {
   else
     truncate_nofollow "$out_file" || rc=91
   fi
-  install_nofollow "$priv_json" "$out_file.raw" || { [[ "$rc" -eq 0 ]] && rc=91; }
-  install_nofollow "$priv_err" "$err_file" || { [[ "$rc" -eq 0 ]] && rc=91; }
+  # Symlink install failures always become 91, even if Codex itself already
+  # returned a non-zero status. The parent must not follow those dests.
+  install_nofollow "$priv_json" "$out_file.raw" || rc=91
+  install_nofollow "$priv_err" "$err_file" || rc=91
   rm -rf "$priv" 2>/dev/null || true
   return "$rc"
 }
