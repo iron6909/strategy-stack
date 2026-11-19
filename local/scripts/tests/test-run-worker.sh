@@ -33,6 +33,7 @@ new_fixture() {
   printf '[user]\n\tname = Test\n\temail = test@example.invalid\n' > "$HOME/.gitconfig"
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
   unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
+  unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY
   PROMPT_SRC=""
 
   BIN="$ROOT/bin"
@@ -44,6 +45,7 @@ new_fixture() {
   cat > "$BIN/pi" <<'PI'
 #!/usr/bin/env bash
 printf 'pi %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "${STUB_LOG:-/dev/null}"
 CUSTOMONLY=0
 case "${STUB_PI:-ok}" in
   fail)  exit 7 ;;
@@ -142,6 +144,7 @@ PI
   cat > "$BIN/agy" <<'AGY'
 #!/usr/bin/env bash
 printf 'agy %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "${STUB_LOG:-/dev/null}"
 # 必须读满 stdin 到 EOF：用例拿字节数与哈希断言「送审内容未截断」
 STDIN_TMP="$(mktemp)"
 cat > "$STDIN_TMP"
@@ -1032,6 +1035,98 @@ run_worker_audit_only
 eq "正例: 审查通过" "$(done_field audit)" "PASS"
 eq "正例: 双绿灯合推" "$(done_field auto_merged)" "1"
 eq "正例: merge reason" "$(done_field merge_reason)" "merged_and_pushed"
+
+# ---------------------------------------------------------------------------
+# MOZ-29：pi/agy 启动前从 $HOME/.harness/providers.env 注入
+# 只用临时 HOME 里的编造假值，真实 ~/.harness/providers.env 不参与任何用例。
+FAKE_KEY="moz29-fake-do-not-use-0001"
+EV_REL=".task/evidence/providers-env.txt"
+
+CASE="providers_env_missing"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+run_worker
+EV="$WORKTREE/$EV_REL"
+eq "exit code" "$RC" "0"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "仍能双绿灯合推" "$(done_field auto_merged)" "1"
+eq "pi 与 agy 都看不到任何注入键" "$(grep -cxF 'env MOZ29_FAKE=unset MOZ29_KEEP=unset' "$ROOT/stub.log")" "2"
+eq "证据记录受信路径" "$(grep -cxF "path=$HOME/.harness/providers.env" "$EV")" "1"
+eq "证据记录 exists=0" "$(grep -cxF 'exists=0' "$EV")" "1"
+eq "证据记录 injected=0" "$(grep -cxF 'injected=0' "$EV")" "1"
+eq "无键名行" "$(grep -c '^key=' "$EV")" "0"
+
+CASE="providers_env_injected"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+mkdir -p "$HOME/.harness"
+printf 'MOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+chmod 600 "$HOME/.harness/providers.env"
+# 诱饵：受信路径之外的同名文件一律不得被 source
+printf 'MOZ29_DECOY_KEY=decoy\n' > "$ROOT/providers.env"
+printf 'MOZ29_DECOY_KEY=decoy\n' > "$REPO/providers.env"
+run_worker
+EV="$WORKTREE/$EV_REL"
+eq "exit code" "$RC" "0"
+eq "pi 与 agy 两个子进程都拿到假键" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset" "$ROOT/stub.log")" "2"
+eq "审查通过" "$(done_field audit)" "PASS"
+eq "双绿灯合推" "$(done_field auto_merged)" "1"
+eq "证据记录 exists=1" "$(grep -cxF 'exists=1' "$EV")" "1"
+eq "证据记录权限" "$(grep -cxF 'mode=600' "$EV")" "1"
+eq "证据记录键名 set" "$(grep -cxF 'key=MOZ29_FAKE_KEY:set' "$EV")" "1"
+eq "非受信路径的同名文件未被 source" "$(grep -c '^key=MOZ29_DECOY_KEY' "$EV")" "0"
+is_true "证据不含假密钥明文" '! grep -qF "$FAKE_KEY" "$EV"'
+is_true "review bundle 不含假密钥明文" '! grep -qF "$FAKE_KEY" "$WORKTREE/.task/review-bundle.txt"'
+is_true "送审 prompt 不含假密钥明文" '! grep -qF "$FAKE_KEY" "$WORKTREE/.task/audit-prompt.txt"'
+is_true "webhook payload 不含假密钥明文" '! grep -qF "$FAKE_KEY" "$PAYLOAD"'
+is_true "worker stdout/stderr 不含假密钥明文" '! grep -qF "$FAKE_KEY" <<< "$OUT"'
+is_true "worktree 在 HOME 之外（跨 worktree 仍从该 HOME 注入）" '[[ "$WORKTREE" != "$HOME"/* ]]'
+
+CASE="providers_env_cross_worktree"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+mkdir -p "$HOME/.harness"
+printf 'MOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+git -C "$REPO" worktree add -q "$ROOT/elsewhere/host" -b host-branch main
+run_worker_at "$ROOT/elsewhere/host"
+OTHER_WORKTREE="$ROOT/elsewhere/worktrees/$TICKET"
+eq "exit code" "$RC" "0"
+eq "worker 在独立 worktree 里仍注入" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=unset" "$ROOT/stub.log")" "2"
+eq "证据落在该 worktree 的 .task/evidence" "$(grep -cxF 'exists=1' "$OTHER_WORKTREE/$EV_REL")" "1"
+eq "独立 worktree 仍双绿灯审查" "$(done_field audit)" "PASS"
+
+CASE="providers_env_source_failure"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass
+mkdir -p "$HOME/.harness"
+printf 'MOZ29_FAKE_KEY=%s\nif then\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+run_worker
+EV="$WORKTREE/$EV_REL"
+eq "source 失败必须非 0 退出" "$RC" "5"
+match "输出写明注入失败" "$OUT" '\[FAIL\] 注入 .*providers\.env 失败'
+is_true "pi 未启动" '[[ -z "$(grep "^pi " "$ROOT/stub.log" 2>/dev/null)" ]]'
+is_true "agy 未启动" '[[ -z "$(agy_lines)" ]]'
+eq "远端未变" "$(remote_main)" "$INIT_SHA"
+exists "worktree 保留" "$WORKTREE"
+eq "证据记录 injected=0" "$(grep -cxF 'injected=0' "$EV")" "1"
+is_true "证据不含假密钥明文" '! grep -qF "$FAKE_KEY" "$EV"'
+is_true "日志不含假密钥明文（source 报错不回显文件内容）" '! grep -qF "$FAKE_KEY" <<< "$OUT"'
+
+CASE="providers_env_keeps_process_env"
+printf '\n[%s]\n' "$CASE"
+new_fixture
+export STUB_PI=ok STUB_AGY=pass MOZ29_KEEP_KEY=from-outer
+mkdir -p "$HOME/.harness"
+printf 'MOZ29_KEEP_KEY=from-file\nMOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+run_worker
+EV="$WORKTREE/$EV_REL"
+eq "pi 与 agy 都保留外层已有值" "$(grep -cxF "env MOZ29_FAKE=$FAKE_KEY MOZ29_KEEP=from-outer" "$ROOT/stub.log")" "2"
+eq "证据记录 key:kept" "$(grep -cxF 'key=MOZ29_KEEP_KEY:kept' "$EV")" "1"
+eq "证据不记被保留变量的值" "$(grep -c from-outer "$EV")" "0"
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"

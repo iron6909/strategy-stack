@@ -3,6 +3,10 @@
 # 自动 git merge --no-ff 合入 base branch 并推送（推送后必须核实远端已包含已审 commit）。
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/providers-env.sh
+. "$SCRIPT_DIR/lib/providers-env.sh"
+
 REPO_DIR=""
 TICKET_ID=""
 PROMPT_FILE=""
@@ -198,6 +202,13 @@ prepare_prompt_copy() {
 if charter_present HEAD; then CHARTER_SEEN_ORIGINAL=1; fi
 prepare_prompt_copy || { echo "[FAIL] 无法生成有效任务提示文件: $PROMPT_COPY"; exit 4; }
 : > "$MERGE_LOG"
+
+# 3.9 受信本地凭据注入：只在 $HOME/.harness/providers.env 存在时 source，缺失即跳过。
+# 必须在 pi/agy 启动之前完成（子进程靠继承拿到变量）；source 失败一律硬失败，绝不 || true。
+inject_providers_env "$EVIDENCE_DIR/providers-env.txt" || {
+  echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
+  exit 5
+}
 
 # 4. 无头运行 Pi Coding Agent（挂载 OpenCode Go 高配额模型，stdin 必须闭合）
 cd "$WORKTREE_DIR"
