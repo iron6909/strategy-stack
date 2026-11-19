@@ -5,22 +5,22 @@
 # OS-level write jail via bwrap when available.
 
 review_cli_name() {
-  local raw="${REVIEW_CLI:-pi}"
+  local raw="${REVIEW_CLI:-codex}"
   raw="${raw,,}"
   case "$raw" in
-    pi|agy) printf '%s' "$raw" ;;
-    *) printf '%s' "pi" ;;
+    codex|pi|agy) printf '%s' "$raw" ;;
+    *) printf '%s' "codex" ;;
   esac
 }
 
 # Video worker engine switch. Default is always pi; MONTAGE_CLI does not
 # inherit REVIEW_CLI (so REVIEW_CLI=agy cannot silently switch montage).
 review_cli_name_for_montage() {
-  local raw="${MONTAGE_CLI:-pi}"
+  local raw="${MONTAGE_CLI:-codex}"
   raw="${raw,,}"
   case "$raw" in
-    pi|agy) printf '%s' "$raw" ;;
-    *) printf '%s' "pi" ;;
+    codex|pi|agy) printf '%s' "$raw" ;;
+    *) printf '%s' "codex" ;;
   esac
 }
 
@@ -227,5 +227,122 @@ run_agy_review() {
     agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m \
     --input-format text < "$prompt_file" > "$out_file" 2>&1
   local rc=$?
+  return "$rc"
+}
+
+# Codex engine helpers (t41 / MOZ-41). Sourced at the end of review-cli.sh.
+# Defaults are codex. pi and agy remain explicit fallbacks.
+# Never prints secrets. Never uses <file < /dev/null (the second redirect wins).
+
+# Copy src onto dest using O_NOFOLLOW (will not write through a symlink dest).
+install_nofollow() {
+  python3 - "$1" "$2" <<'PY'
+import errno, os, sys
+src, dest = sys.argv[1], sys.argv[2]
+flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC
+try:
+    fd = os.open(dest, flags, 0o644)
+except OSError as e:
+    sys.exit(91 if e.errno in (errno.ELOOP, getattr(errno, "ELOOP", errno.EPERM)) else 1)
+with os.fdopen(fd, "wb") as out, open(src, "rb") as inp:
+    while True:
+        chunk = inp.read(1024 * 1024)
+        if not chunk:
+            break
+        out.write(chunk)
+PY
+}
+
+worker_cli_name() {
+  local raw="${WORKER_CLI:-codex}"
+  raw="${raw,,}"
+  case "$raw" in
+    codex|pi|agy) printf '%s' "$raw" ;;
+    *) printf '%s' "codex" ;;
+  esac
+}
+
+ensure_codex_on_path() {
+  if command -v codex >/dev/null 2>&1; then
+    return 0
+  fi
+  local d="${HOME:-}/.local/share/mise/installs/node/24.14.0/bin"
+  if [[ -x "$d/codex" ]]; then
+    PATH="$d:${PATH:-}"
+    export PATH
+    return 0
+  fi
+  return 127
+}
+
+# Implementation / montage: Codex's own approval+sandbox bypass only.
+# Prompt is read from stdin to EOF via a single redirect. Not interactive.
+run_codex_exec() {
+  local prompt_file="$1" work_dir="$2" out_file="$3"
+  local err_file="${4:-$out_file.err}"
+  ensure_codex_on_path || return 127
+  local bin
+  bin="$(command -v codex)" || return 127
+  [[ -f "$prompt_file" ]] || return 2
+  mkdir -p "$(dirname "$out_file")"
+  set +e
+  # Single stdin source. Do not append "< /dev/null" after this redirect.
+  "$bin" exec --dangerously-bypass-approvals-and-sandbox --color never \
+    -C "$work_dir" --json \
+    - < "$prompt_file" > "$out_file" 2>"$err_file"
+  local rc=$?
+  return "$rc"
+}
+
+# Independent review: native Codex read-only sandbox. No bypass.
+# Fresh process (--ephemeral, no resume). Prompt from stdin file to EOF.
+run_codex_review() {
+  local prompt_file="$1" out_file="$2" worktree_dir="$3" allowed_dir="${4:-$(dirname "$out_file")}"
+  local err_file="${5:-$out_file.err}"
+  ensure_codex_on_path || return 127
+  local bin
+  bin="$(command -v codex)" || return 127
+  [[ -f "$prompt_file" ]] || return 2
+  mkdir -p "$allowed_dir"
+  {
+    wc -c < "$prompt_file" | tr -d " " > "$allowed_dir/review-argfile.bytes"
+    sha256sum "$prompt_file" | cut -d" " -f1 > "$allowed_dir/review-argfile.sha"
+    wc -c < "$prompt_file" | tr -d " " > "$allowed_dir/review-stdin.bytes"
+    printf 'codex-review exec --sandbox read-only --ephemeral --color never -C %s --output-last-message <stdin-file> -\n' \
+      "$worktree_dir" > "$allowed_dir/review-argv.txt"
+  } 2>/dev/null || true
+
+  local priv
+  priv="$(mktemp -d "${TMPDIR:-/var/tmp}/codex-audit-out.XXXXXX")"
+  local priv_last="$priv/last.txt" priv_json="$priv/out.jsonl" priv_err="$priv/err.txt"
+  : > "$priv_last" ; : > "$priv_json" ; : > "$priv_err"
+
+  local -a timeout_cmd=()
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout -k 10 15m)
+  fi
+
+  set +e
+  # Single stdin source from the SHA-bound pack. No trailing /dev/null.
+  "${timeout_cmd[@]}" "$bin" exec --sandbox read-only --ephemeral --color never \
+    -C "$worktree_dir" \
+    --output-last-message "$priv_last" \
+    --json \
+    - < "$prompt_file" > "$priv_json" 2>"$priv_err"
+  local rc=$?
+
+  if [[ -s "$priv_last" ]]; then
+    install_nofollow "$priv_last" "$out_file" || rc=91
+  elif [[ -s "$priv_json" ]]; then
+    extract_review_text "$priv_json" "$out_file" >/dev/null || true
+    if [[ ! -s "$out_file" ]]; then
+      rc="${rc:-1}"
+    fi
+  else
+    : > "$out_file"
+  fi
+  install_nofollow "$priv_json" "$out_file.raw" 2>/dev/null || true
+  install_nofollow "$priv_err" "$err_file" 2>/dev/null || true
+  rm -rf "$priv" 2>/dev/null || true
   return "$rc"
 }

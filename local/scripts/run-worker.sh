@@ -235,22 +235,28 @@ inject_providers_env "$EVIDENCE_DIR/providers-env.txt" || {
 merge_no_proxy_loopback
 load_desktop_session_env
 
-# 4. 无头运行 Pi Coding Agent（挂载 OpenCode Go 高配额模型，stdin 必须闭合）
+# 4. 无头运行实施引擎（WORKER_CLI=codex 默认）。Codex 从文件 stdin 读到 EOF，禁止再叠 < /dev/null。
 cd "$WORKTREE_DIR"
+ensure_codex_on_path || true
+WORKER_ENGINE="$(worker_cli_name)"
 SES_FILE=""
 if [[ "$AUDIT_ONLY" -eq 1 ]]; then
-  # 不跑 pi、不 --resume、不改实现：只复用当前 feat/<ticket> tip 重做异构审查
+  # 不跑实施引擎、不 --resume、不改实现：只复用当前 feat/<ticket> tip 重做异构审查
   PI_EXIT=0
 else
   set +e
-  if [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
+  if [[ "$WORKER_ENGINE" == "codex" ]]; then
+    run_codex_exec "$PROMPT_COPY" "$WORKTREE_DIR" "$TASK_DIR/$TICKET_ID.jsonl" "$TASK_DIR/$TICKET_ID.jsonl.err"
+    PI_EXIT=$?
+  elif [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
     pi --session-dir "$TASK_DIR/sessions" --session "$RESUME_SESSION" --mode json \
        -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+    PI_EXIT=$?
   else
     pi --session-dir "$TASK_DIR/sessions" --mode json \
        -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+    PI_EXIT=$?
   fi
-  PI_EXIT=$?
   set -e
   SES_FILE=$(ls -t "$TASK_DIR/sessions/"*.jsonl 2>/dev/null | head -n 1 || echo "")
 fi
@@ -633,6 +639,9 @@ if [[ "$PI_EXIT" -eq 0 ]]; then
     AUDIT_VERDICT="FAIL"; AUDIT_REASON="no_commits_ahead_of_base"
   else
     REVIEW_ENGINE="$(review_cli_name)"
+    if [[ "$REVIEW_ENGINE" == "codex" ]]; then
+      ensure_codex_on_path || true
+    fi
     if ! command -v "$REVIEW_ENGINE" >/dev/null 2>&1; then
     AUDIT_VERDICT="FAIL"; AUDIT_REASON="${REVIEW_ENGINE}_missing"
   else
@@ -663,17 +672,23 @@ AUDIT_PROMPT_HEAD
 
     if [[ "$CUSTOM_GATE_BLOCKED" -eq 0 ]]; then
       set +e
-      if [[ "$REVIEW_ENGINE" == "agy" ]]; then
-        # SSH 会话下 agy 会改走文件凭证并表现为未登录：子进程摘掉 SSH_* 复用本机已登录 keyring。
-        # 只摘环境变量，不读取/拷贝/打印任何 token 或凭据文件，不改平台安全控制。
-        run_agy_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE"
-        REVIEW_EXIT=$?
-        AGY_EXIT="$REVIEW_EXIT"
-      else
-        # 审查输出落到 .task/（可写绑定）；工作区其余路径在 bwrap 下只读。
-        run_pi_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE.raw" "$TASK_DIR" "$AUDIT_FILE.err"
-        REVIEW_EXIT=$?
-      fi
+      case "$REVIEW_ENGINE" in
+        agy)
+          # SSH 会话下 agy 会改走文件凭证并表现为未登录：子进程摘掉 SSH_* 复用本机已登录 keyring。
+          run_agy_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE"
+          REVIEW_EXIT=$?
+          AGY_EXIT="$REVIEW_EXIT"
+          ;;
+        pi)
+          run_pi_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE.raw" "$TASK_DIR" "$AUDIT_FILE.err"
+          REVIEW_EXIT=$?
+          ;;
+        *)
+          # Codex 内核/原生 --sandbox read-only；不使用 bypass；prompt 从 stdin 读到 EOF。
+          run_codex_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE" "$WORKTREE_DIR" "$TASK_DIR" "$AUDIT_FILE.err"
+          REVIEW_EXIT=$?
+          ;;
+      esac
       set -e
       if [[ "$REVIEW_ENGINE" == "pi" && "$REVIEW_EXIT" -eq 90 ]]; then
         printf 'VERDICT: FAIL\n[Act On] review sandbox (bwrap) is required and was not available.\n' > "$AUDIT_FILE"

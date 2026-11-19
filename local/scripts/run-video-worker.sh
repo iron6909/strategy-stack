@@ -77,9 +77,10 @@ inject_providers_env "$PROJECT_DIR/.task/evidence/providers-env.txt" || {
 merge_no_proxy_loopback
 load_desktop_session_env
 
-# 3. 启动本地引擎全权操纵 OpenMontage 五层流水线（MONTAGE_CLI=pi 默认；agy 可回退）
-# 非交互：指令落盘后用 @file 传入，闭合 stdin。pi 无 --yolo，保留工具以便驱动流水线。
+# 3. 启动本地引擎全权操纵 OpenMontage 五层流水线（MONTAGE_CLI=codex 默认；pi/agy 可回退）
+# 非交互：指令落盘后从 stdin 读到 EOF。禁止再叠 < /dev/null。
 cd "$MONTAGE_DIR"
+ensure_codex_on_path || true
 ENGINE="$(review_cli_name_for_montage)"
 DIRECTIVE_FILE="$PROJECT_DIR/.task/$TICKET_ID-engine-directive.md"
 cat > "$DIRECTIVE_FILE" <<DIRECTIVE
@@ -96,22 +97,28 @@ DIRECTIVE
 
 ENGINE_LOG="$PROJECT_DIR/.task/$TICKET_ID-${ENGINE}.log"
 set +e
-if [[ "$ENGINE" == "agy" ]]; then
-  AGY_FLAGS=""
-  if agy --help 2>&1 | grep -q -- "--yolo"; then
-    AGY_FLAGS="--yolo"
-  elif agy --help 2>&1 | grep -q -- "--dangerously-skip-permissions"; then
-    AGY_FLAGS="--dangerously-skip-permissions"
-  fi
-  # 旧路径：短指令若超限仍可能失败；本轮默认不走 agy。
-  agy $AGY_FLAGS -p "$(cat "$DIRECTIVE_FILE")" < /dev/null > "$ENGINE_LOG" 2>&1
-  AGY_EXIT=$?
-else
-  pi --no-session --mode text \
-    -p "Follow the attached OpenMontage directive and complete the job non-interactively." \
-    "@${DIRECTIVE_FILE}" < /dev/null > "$ENGINE_LOG" 2>&1
-  AGY_EXIT=$?
-fi
+case "$ENGINE" in
+  agy)
+    AGY_FLAGS=""
+    if agy --help 2>&1 | grep -q -- "--yolo"; then
+      AGY_FLAGS="--yolo"
+    elif agy --help 2>&1 | grep -q -- "--dangerously-skip-permissions"; then
+      AGY_FLAGS="--dangerously-skip-permissions"
+    fi
+    agy $AGY_FLAGS -p "$(cat "$DIRECTIVE_FILE")" < /dev/null > "$ENGINE_LOG" 2>&1
+    AGY_EXIT=$?
+    ;;
+  pi)
+    pi --no-session --mode text \
+      -p "Follow the attached OpenMontage directive and complete the job non-interactively." \
+      "@${DIRECTIVE_FILE}" < /dev/null > "$ENGINE_LOG" 2>&1
+    AGY_EXIT=$?
+    ;;
+  *)
+    run_codex_exec "$DIRECTIVE_FILE" "$MONTAGE_DIR" "$ENGINE_LOG" "$ENGINE_LOG.err"
+    AGY_EXIT=$?
+    ;;
+esac
 set -e
 
 FINAL_VIDEO="$PROJECT_DIR/output/final.mp4"

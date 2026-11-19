@@ -34,7 +34,7 @@ new_fixture() {
   unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM STUB_AGY STUB_PI STUB_CURL_OUT STUB_PI_TASK STUB_SHA_OUT
   unset STUB_AGY_STDIN_BYTES STUB_AGY_STDIN_SHA STUB_AGY_STDIN_COPY STUB_PI_EVIDENCE_FILES STUB_PI_EVIDENCE_BYTES
   unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY NO_PROXY no_proxy
-  unset REVIEW_CLI MONTAGE_CLI STUB_PI_REVIEW STUB_REVIEW_CANARY OTHER_WORKTREE
+  unset REVIEW_CLI MONTAGE_CLI WORKER_CLI STUB_PI_REVIEW STUB_REVIEW_CANARY OTHER_WORKTREE
   PROMPT_SRC=""
 
   BIN="$ROOT/bin"
@@ -292,7 +292,74 @@ for a in "$@"; do
   prev="$a"
 done
 CURL
-  chmod +x "$BIN/pgrep" "$BIN/free" "$BIN/pi" "$BIN/agy" "$BIN/curl"
+  cat > "$BIN/codex" <<'CODEX'
+#!/usr/bin/env bash
+# Test stub: review if --sandbox read-only (no bypass). Otherwise implement like pi.
+sandbox_ro=0
+bypass=0
+last_out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --sandbox)
+      [[ "$a" == "read-only" ]] && sandbox_ro=1
+      ;;
+    --output-last-message)
+      last_out="$a"
+      ;;
+  esac
+  case "$a" in
+    --dangerously-bypass-approvals-and-sandbox) bypass=1 ;;
+  esac
+  prev="$a"
+done
+
+if [[ "$sandbox_ro" -eq 1 && "$bypass" -eq 0 ]]; then
+  # Env/proxy go to stderr only (parent AUDIT_FILE.err). Do not also write
+  # them to STUB_LOG, or count_impl_and_review would see 3 copies.
+  printf 'codex-review %s\n' "$*" >&2
+  printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >&2
+  printf 'proxy NO_PROXY=%s no_proxy=%s\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >&2
+  STDIN_TMP="$(mktemp)"
+  cat > "$STDIN_TMP"
+  if [[ -n "${STUB_AGY_STDIN_BYTES:-}" ]]; then wc -c < "$STDIN_TMP" | tr -d ' ' > "$STUB_AGY_STDIN_BYTES"; fi
+  if [[ -n "${STUB_AGY_STDIN_SHA:-}" ]]; then sha256sum "$STDIN_TMP" | cut -d' ' -f1 > "$STUB_AGY_STDIN_SHA"; fi
+  if [[ -n "${STUB_AGY_STDIN_COPY:-}" ]]; then cp "$STDIN_TMP" "$STUB_AGY_STDIN_COPY"; fi
+  rm -f "$STDIN_TMP"
+  # Simulate read-only: do not write the worktree or user-config canaries.
+  _body=""
+  _rc=0
+  case "${STUB_AGY:-pass}" in
+    fail)  _body=$'VERDICT: FAIL\n[Act On] 缺真实证据\n' ;;
+    empty) _body="" ;;
+    fake)  _body=$'好的，我先说明一下审查口径。\nVERDICT: PASS\n[Act On] 无\n' ;;
+    late)  _body=$'VERDICT: PASS\n[Act On] 无\n'; _rc=4 ;;
+    postchange|basepush|treetask|treeout|treeagents)
+      # These mutation cases should set REVIEW_CLI=agy; if they hit Codex, do not write.
+      _body=$'VERDICT: PASS\n[Consider] 无\n' ;;
+    *) _body=$'VERDICT: PASS\n[Act On] 无\n[Consider] 无\n[Dismissed] 无\n' ;;
+  esac
+  if [[ -n "$_body" ]]; then
+    if [[ -n "$last_out" ]]; then
+      printf '%s' "$_body" > "$last_out"
+    fi
+    python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$_body"
+  fi
+  exit "$_rc"
+fi
+
+# Coding: consume the stdin prompt (worker uses a single file redirect, not argv).
+# Record the charter separator so tests can prove the injected prompt arrived.
+_prompt_tmp="$(mktemp)"
+cat > "$_prompt_tmp"
+printf 'codex-exec %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+if grep -qxF "=== 本次具体工单任务 ===" "$_prompt_tmp"; then
+  printf '%s\n' "=== 本次具体工单任务 ===" >> "${STUB_LOG:-/dev/null}"
+fi
+rm -f "$_prompt_tmp"
+exec "$(dirname "$0")/pi" "$@" < /dev/null
+CODEX
+  chmod +x "$BIN/pgrep" "$BIN/free" "$BIN/pi" "$BIN/agy" "$BIN/curl" "$BIN/codex"
   export PATH="$BIN:$BASE_PATH"
   export STUB_LOG="$ROOT/stub.log"
 
@@ -338,10 +405,10 @@ agy_lines() { grep '^agy ' "$ROOT/stub.log" 2>/dev/null || true; }
 agy_argv_maxlen() { awk '/^agy /{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$ROOT/stub.log" 2>/dev/null; }
 review_lines() {
   { cat "$WORKTREE/.task/review-argv.txt" 2>/dev/null || true
-    grep '^pi-review ' "$WORKTREE/.task/stub-review.log" 2>/dev/null || true
+    grep -E '^(pi-review |codex-review )' "$WORKTREE/.task/stub-review.log" 2>/dev/null || true
   }
 }
-review_argv_maxlen() { awk '/^pi-review /{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$WORKTREE/.task/review-argv.txt" "$WORKTREE/.task/stub-review.log" 2>/dev/null; }
+review_argv_maxlen() { awk '/^(pi-review |codex-review )/{ if (length($0) > m) m = length($0) } END { print m + 0 }' "$WORKTREE/.task/review-argv.txt" "$WORKTREE/.task/stub-review.log" 2>/dev/null; }
 count_impl_and_review() {
   local pat="$1" n=0 c side
   c=$(grep -cF "$pat" "$ROOT/stub.log" 2>/dev/null || true)
@@ -391,16 +458,15 @@ eq "payload merge_commit" "$(payload_field merge_commit)" "$MERGE_SHA"
 eq "payload evidence_dir 为持久目录" "$(payload_field evidence_dir)" "$HOME/task-archive/$TICKET"
 eq "webhook 投递体 auto_merged" "$(grep -oE '\"auto_merged\": [01]' "$ROOT/posted.json" 2>/dev/null)" '"auto_merged": 1'
 eq "payload 向后兼容字段 pi_exit" "$(payload_field pi_exit)" "0"
-eq "payload engine 为 pi" "$(payload_field engine)" "pi"
+eq "payload engine 为 codex" "$(payload_field engine)" "codex"
 exists "审查 prompt 全文落盘" "$WORKTREE/.task/audit-prompt.txt"
-match "pi 审查禁用工具与会话" "$(review_lines)" "--no-tools"
-match "pi 审查 --no-session" "$(review_lines)" "--no-session"
-match "pi 审查 --mode json" "$(review_lines)" "--mode json"
-is_true "pi 审查用 @file 传 prompt" '[[ "$(review_lines)" == *" @"* ]]'
-eq "@file 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
-eq "@file 哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
-eq "审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
-is_true "pi 审查 argv 未塞进 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/stub-review.log"'
+match "codex 审查使用 read-only 沙箱" "$(review_lines)" "--sandbox read-only"
+match "codex 审查 --ephemeral" "$(review_lines)" "--ephemeral"
+is_true "codex 审查未使用 bypass" '! grep -q "dangerously-bypass-approvals-and-sandbox" <<<"$(review_lines)"'
+eq "stdin 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
+eq "送审文件哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
+is_true "实施态使用 bypass" 'grep -q "dangerously-bypass-approvals-and-sandbox" "$ROOT/stub.log"'
+is_true "审查 argv 未塞进 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/review-argv.txt"'
 
 # ---------------------------------------------------------------------------
 CASE="pi_failure"
@@ -721,12 +787,12 @@ big_bundle_case() {
   eq "$label: 审查通过" "$(done_field audit)" "PASS"
   eq "$label: 双绿灯合推" "$(done_field auto_merged)" "1"
   is_true "$label: 送审 prompt 超过 128KiB 单参数上限（$total bytes）" '[[ "$(cat "$WORKTREE/.task/review-argfile.bytes")" -gt 131072 ]]'
-  eq "$label: @file 读满全部字节（无截断）" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$total"
-  eq "$label: @file 哈希与 prompt 文件一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$prompt_path" | cut -d' ' -f1)"
-  eq "$label: 审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
-  match "$label: pi 审查用 @file" "$(review_lines)" "@"
-  is_true "$label: pi-review argv 长度 < 4KB（指令短，正文在文件里）" '[[ "$(review_argv_maxlen)" -lt 4096 ]]'
-  is_true "$label: argv 未混入 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/stub-review.log"'
+  eq "$label: stdin 读满全部字节（无截断）" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "$total"
+  eq "$label: 送审文件哈希与 prompt 文件一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$prompt_path" | cut -d' ' -f1)"
+  match "$label: codex 审查 read-only" "$(review_lines)" "--sandbox read-only"
+  is_true "$label: 审查未使用 bypass" '! grep -q "dangerously-bypass-approvals-and-sandbox" <<<"$(review_lines)"'
+  is_true "$label: review-argv 长度 < 4KB（正文在 stdin 文件，不进 argv）" '[[ "$(review_argv_maxlen)" -lt 4096 ]]'
+  is_true "$label: argv 未混入 bundle 正文" '! grep -q "REVIEW BUNDLE" "$WORKTREE/.task/review-argv.txt"'
   printf '  proof: %s prompt=%s bytes argfile=%s bytes argv_max=%s bytes\n' \
     "$label" "$total" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(review_argv_maxlen)"
 }
@@ -756,7 +822,7 @@ export STUB_AGY=pass STUB_AGY_STDIN_BYTES="$ROOT/stdin.bytes" STUB_AGY_STDIN_SHA
 run_worker_audit_only
 PROMPT_PATH="$WORKTREE/.task/audit-prompt.txt"
 eq "exit code" "$RC" "0"
-is_true "未运行 pi" '[[ -z "$(grep "^pi " "$ROOT/stub.log" 2>/dev/null)" ]]'
+is_true "未运行实施引擎" '[[ -z "$(grep -E "^(pi |codex-exec )" "$ROOT/stub.log" 2>/dev/null)" ]]'
 eq "已审 commit 就是既有 tip（未重写）" "$(payload_field audited_commit)" "$TIP"
 eq "worktree tip 未漂移" "$(git -C "$WORKTREE" rev-parse HEAD)" "$TIP"
 eq "审查通过" "$(done_field audit)" "PASS"
@@ -764,9 +830,9 @@ eq "双绿灯合推" "$(done_field auto_merged)" "1"
 eq "merge reason" "$(done_field merge_reason)" "merged_and_pushed"
 eq "远端 tip == merge_commit" "$(done_field merge_commit)" "$(remote_main)"
 is_true "远端已含既有 tip" "git -C '$ROOT/remote.git' merge-base --is-ancestor '$TIP' refs/heads/main"
-eq "@file 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.bytes")" "$(stat -c %s "$PROMPT_PATH")"
-eq "@file 哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$PROMPT_PATH" | cut -d' ' -f1)"
-eq "审查 stdin 已关闭" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "0"
+eq "stdin 字节数与 prompt 一致" "$(cat "$WORKTREE/.task/review-stdin.bytes")" "$(stat -c %s "$PROMPT_PATH")"
+eq "送审文件哈希与 prompt 一致" "$(cat "$WORKTREE/.task/review-argfile.sha")" "$(sha256sum "$PROMPT_PATH" | cut -d' ' -f1)"
+is_true "审查使用 read-only 沙箱" '[[ "$(review_lines)" == *"--sandbox read-only"* ]]'
 
 # ---------------------------------------------------------------------------
 CASE="audit_only_rejects_uncommitted_implementation"
@@ -909,7 +975,7 @@ eq "分隔行只出现一次" "$(grep -cxF '=== 本次具体工单任务 ===' "$
 eq "宪章标题只出现一次" "$(grep -cxF '# 测试宪章' "$P")" "1"
 eq "原 prompt 正文仍在尾部" "$(tail -n1 "$P")" "$(tail -n1 "$ROOT/prompt.md")"
 is_true "提示文件不是截空的（比宪章头更长）" '[[ "$(stat -c %s "$P")" -gt "$HEAD_BYTES" ]]'
-is_true "pi 收到的是注入后的提示" '[[ "$(grep -cxF "=== 本次具体工单任务 ===" "$ROOT/stub.log")" -ge 1 ]]'
+is_true "实施引擎 stdin 收到注入后的提示" '[[ "$(grep -cxF "=== 本次具体工单任务 ===" "$ROOT/stub.log")" -ge 1 ]]'
 match "review bundle 含宪章" "$(cat "$WORKTREE/.task/review-bundle.txt" 2>/dev/null)" "只允许改 custom/"
 match "送审 prompt 含宪章" "$(cat "$WORKTREE/.task/audit-prompt.txt" 2>/dev/null)" "只允许改 custom/"
 printf '  proof: charter_head=%s bytes prompt_copy=%s bytes\n' "$HEAD_BYTES" "$(stat -c %s "$P")"
@@ -1283,7 +1349,8 @@ eq "审查仍可通过（写失败不得冒充工具成功）" "$(done_field aud
 eq "双绿灯合推" "$(done_field auto_merged)" "1"
 absent "审查进程写不进 worktree" "$WORKTREE/pwned-by-review.txt"
 absent "审查进程写不进 jail 外 canary" "$ROOT/pwned-by-review.txt"
-match "审查调用了 --no-tools" "$(review_lines)" "--no-tools"
+match "审查调用了 --sandbox read-only" "$(review_lines)" "--sandbox read-only"
+is_true "写禁测试未使用 bypass" '! grep -q "dangerously-bypass-approvals-and-sandbox" <<<"$(review_lines)"'
 
 CASE="review_cli_agy_fallback"
 printf '\n[%s]\n' "$CASE"
@@ -1328,10 +1395,10 @@ printf '\n[%s]\n' "$CASE"
 # shellcheck source=../lib/review-cli.sh
 . "$HERE/../lib/review-cli.sh"
 unset MONTAGE_CLI REVIEW_CLI
-eq "双开关都缺省时 montage 为 pi" "$(review_cli_name_for_montage)" "pi"
+eq "双开关都缺省时 montage 为 codex" "$(review_cli_name_for_montage)" "codex"
 REVIEW_CLI=agy
 unset MONTAGE_CLI
-eq "REVIEW_CLI=agy 不会拖动 montage 默认" "$(review_cli_name_for_montage)" "pi"
+eq "REVIEW_CLI=agy 不会拖动 montage 默认" "$(review_cli_name_for_montage)" "codex"
 MONTAGE_CLI=agy
 eq "MONTAGE_CLI=agy 仍可显式回退" "$(review_cli_name_for_montage)" "agy"
 unset MONTAGE_CLI REVIEW_CLI
