@@ -65,6 +65,14 @@ if [[ "$is_review" -eq 1 ]]; then
   _log "pi-review $*"
   _log "env MOZ29_FAKE=${MOZ29_FAKE_KEY:-unset} MOZ29_KEEP=${MOZ29_KEEP_KEY:-unset}"
   _log "proxy NO_PROXY=${NO_PROXY:-unset} no_proxy=${no_proxy:-unset}"
+  # stderr is held by the parent (AUDIT_FILE.err) and remains observable
+  # when the jail blocks writes to STUB_LOG / .task sidecars.
+  printf 'pi-review %s
+' "$*" >&2
+  printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s
+' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >&2
+  printf 'proxy NO_PROXY=%s no_proxy=%s
+' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >&2
   _stdin_tmp="$(mktemp -p "${_sidecar:-/tmp}" stdin.XXXXXX 2>/dev/null || mktemp)"
   cat > "$_stdin_tmp"
   if [[ -n "$_sidecar" ]]; then
@@ -121,9 +129,10 @@ if [[ "$is_review" -eq 1 ]]; then
       git replace HEAD "$repl" ;;
     *) _body=$'VERDICT: PASS\n[Act On] 无\n[Consider] 无\n[Dismissed] 无\n' ;;
   esac
-  if [[ -n "$_body" && -n "$_sidecar" ]]; then
-    printf '%s' "$_body" > "$_sidecar/review-body.txt"
-    python3 -c 'import json,pathlib,sys; print(json.dumps({"text": pathlib.Path(sys.argv[1]).read_text()}))' "$_sidecar/review-body.txt"
+  # Stdout is the verdict JSON (parent redirected, outside the jail). Do not
+  # depend on a writable sidecar; .task is intentionally read-only in the jail.
+  if [[ -n "$_body" ]]; then
+    python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1]}))' "$_body"
   fi
   exit "$_rc"
 fi
@@ -337,7 +346,7 @@ count_impl_and_review() {
   local pat="$1" n=0 c side
   c=$(grep -cF "$pat" "$ROOT/stub.log" 2>/dev/null || true)
   n=$((n + ${c:-0}))
-  for side in "$WORKTREE/.task/stub-review.log" "${OTHER_WORKTREE:-}/.task/stub-review.log"; do
+  for side in "$WORKTREE/.task/stub-review.log"               "$WORKTREE/.task/"*"-audit.md.err"               "${OTHER_WORKTREE:-}/.task/stub-review.log"               "${OTHER_WORKTREE:-}/.task/"*"-audit.md.err"; do
     [[ -f "$side" ]] || continue
     c=$(grep -cF "$pat" "$side" || true)
     n=$((n + ${c:-0}))
@@ -1290,6 +1299,42 @@ is_true "agy 不再用 -p 传 prompt" '[[ "$(agy_lines)" != *" -p "* ]]'
 eq "agy stdin 读满整份 prompt" "$(cat "$ROOT/stdin.bytes")" "$(stat -c %s "$WORKTREE/.task/audit-prompt.txt")"
 eq "agy stdin 哈希与 prompt 文件一致" "$(cat "$ROOT/stdin.sha")" "$(sha256sum "$WORKTREE/.task/audit-prompt.txt" | cut -d' ' -f1)"
 is_true "本用例未走 pi 审查" '[[ -z "$(review_lines)" ]]'
+
+# ---------------------------------------------------------------------------
+CASE="extract_review_text_jsonl"
+printf '\n[%s]\n' "$CASE"
+# shellcheck source=../lib/review-cli.sh
+. "$HERE/../lib/review-cli.sh"
+_ex="$(mktemp -d)"
+printf '%s\n' '{"text":"VERDICT: PASS\n[Act On] 无\n"}' > "$_ex/simple.json"
+eq "单对象 JSON 首行" "$(extract_review_text "$_ex/simple.json" "$_ex/simple.out")" "VERDICT: PASS"
+match "单对象 JSON 正文" "$(cat "$_ex/simple.out")" "VERDICT: PASS"
+cat > "$_ex/stream.jsonl" <<'JSONL'
+{"type":"session"}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","delta":"I will not leak thinking as the verdict.\nVERDICT: PASS\n"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"VERDICT: FAIL\n"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"[Act On] 从 JSONL text_delta 组装\n"}}
+{"type":"turn_end"}
+JSONL
+eq "JSONL 忽略 thinking 并组装 text_delta" "$(extract_review_text "$_ex/stream.jsonl" "$_ex/stream.out")" "VERDICT: FAIL"
+match "JSONL 正文来自 text_delta" "$(cat "$_ex/stream.out")" "从 JSONL text_delta 组装"
+printf '\n  \n' > "$_ex/blank.txt"
+eq "空白报告首行为空" "$(extract_review_text "$_ex/blank.txt" "$_ex/blank.out")" ""
+eq "空白报告文件大小为 0" "$(stat -c %s "$_ex/blank.out")" "0"
+rm -rf "$_ex"
+
+CASE="montage_cli_independent_of_review_cli"
+printf '\n[%s]\n' "$CASE"
+# shellcheck source=../lib/review-cli.sh
+. "$HERE/../lib/review-cli.sh"
+unset MONTAGE_CLI REVIEW_CLI
+eq "双开关都缺省时 montage 为 pi" "$(review_cli_name_for_montage)" "pi"
+REVIEW_CLI=agy
+unset MONTAGE_CLI
+eq "REVIEW_CLI=agy 不会拖动 montage 默认" "$(review_cli_name_for_montage)" "pi"
+MONTAGE_CLI=agy
+eq "MONTAGE_CLI=agy 仍可显式回退" "$(review_cli_name_for_montage)" "agy"
+unset MONTAGE_CLI REVIEW_CLI
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"
