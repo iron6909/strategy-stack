@@ -4,6 +4,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/providers-env.sh
 . "$SCRIPT_DIR/lib/providers-env.sh"
+. "$SCRIPT_DIR/lib/desktop-env.sh"
+# shellcheck source=lib/review-cli.sh
+. "$SCRIPT_DIR/lib/review-cli.sh"
+
+# 回环绕行兜底（MOZ-36 baseline, integrated here so this branch does not
+# merge the unreviewed feat/MOZ-36 commit). Existing hosts kept; both spellings set.
+merge_no_proxy_loopback() {
+  local merged="" raw entry
+  local -a parts=()
+  local -A seen=()
+  for raw in "${NO_PROXY-}" "${no_proxy-}" '127.0.0.1,localhost,::1'; do
+    [[ -n "$raw" ]] || continue
+    IFS=',' read -r -a parts <<< "$raw"
+    for entry in "${parts[@]}"; do
+      entry="${entry//[[:space:]]/}"
+      [[ -n "$entry" && -z "${seen[$entry]-}" ]] || continue
+      seen[$entry]=1
+      merged="${merged:+$merged,}$entry"
+    done
+  done
+  export NO_PROXY="$merged" no_proxy="$merged"
+}
+
 
 MONTAGE_DIR=""
 TICKET_ID=""
@@ -46,15 +69,22 @@ mkdir -p "$PROJECT_DIR/output" "$PROJECT_DIR/tmp" "$PROJECT_DIR/.task/evidence"
 cp "$PROMPT_FILE" "$PROJECT_DIR/.task/$TICKET_ID-brief.md"
 
 # 2.5 受信本地凭据注入：只在 $HOME/.harness/providers.env 存在时 source，缺失即跳过。
-# 必须在 agy 启动之前完成；source 失败一律硬失败，绝不 || true。
+# 必须在引擎启动之前完成；source 失败一律硬失败，绝不 || true。
 inject_providers_env "$PROJECT_DIR/.task/evidence/providers-env.txt" || {
   echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
   exit 5
 }
+merge_no_proxy_loopback
+load_desktop_session_env
 
-# 3. 启动 agy 全权操纵 OpenMontage 五层流水线（免批模式 + 闭合 Stdin 防止后台挂起）
+# 3. 启动本地引擎全权操纵 OpenMontage 五层流水线（MONTAGE_CLI=codex 默认；pi/agy 可回退）
+# 非交互：指令落盘后从 stdin 读到 EOF。禁止再叠 < /dev/null。
 cd "$MONTAGE_DIR"
-AGY_DIRECTIVE="你是 OpenMontage (MyMontage) 自主视频创作引擎统帅。当前位于仓库根目录（$MONTAGE_DIR）。
+ensure_codex_on_path || true
+ENGINE="$(review_cli_name_for_montage)"
+DIRECTIVE_FILE="$PROJECT_DIR/.task/$TICKET_ID-engine-directive.md"
+cat > "$DIRECTIVE_FILE" <<DIRECTIVE
+你是 OpenMontage (MyMontage) 自主视频创作引擎统帅。当前位于仓库根目录（$MONTAGE_DIR）。
 请严格遵循 OpenMontage 五层架构（读取根目录 SKILL.md / AGENTS.md 入口契约、调用内置产线与 custom/ 扩展插件、使用 tools/ 注册表工具与 remotion-composer 渲染，并执行内置工程化质量门禁），全权完成本次视频创作任务。
 【免侵入式创作铁律】
 1. 严禁修改 MyMontage 任何现有框架源码或配置文件（保持 git status 干净）。
@@ -62,19 +92,33 @@ AGY_DIRECTIVE="你是 OpenMontage (MyMontage) 自主视频创作引擎统帅。�
 3. 最终合成通过内置质量门禁的视频成片必须输出至：$PROJECT_DIR/output/final.mp4（配套 .srt 字幕、封面图或分镜说明一并输出至 $PROJECT_DIR/output/）。
 
 === 本次视频创作任务书 ===
-$(cat "$PROJECT_DIR/.task/$TICKET_ID-brief.md")"
+$(cat "$PROJECT_DIR/.task/$TICKET_ID-brief.md")
+DIRECTIVE
 
-# 自动探测 agy 支持的免批参数（如 --yolo）并闭合标准输入
-AGY_FLAGS=""
-if agy --help 2>&1 | grep -q -- "--yolo"; then
-  AGY_FLAGS="--yolo"
-elif agy --help 2>&1 | grep -q -- "--dangerously-skip-permissions"; then
-  AGY_FLAGS="--dangerously-skip-permissions"
-fi
-
+ENGINE_LOG="$PROJECT_DIR/.task/$TICKET_ID-${ENGINE}.log"
 set +e
-agy $AGY_FLAGS -p "$AGY_DIRECTIVE" < /dev/null > "$PROJECT_DIR/.task/$TICKET_ID-agy.log" 2>&1
-AGY_EXIT=$?
+case "$ENGINE" in
+  agy)
+    AGY_FLAGS=""
+    if agy --help 2>&1 | grep -q -- "--yolo"; then
+      AGY_FLAGS="--yolo"
+    elif agy --help 2>&1 | grep -q -- "--dangerously-skip-permissions"; then
+      AGY_FLAGS="--dangerously-skip-permissions"
+    fi
+    agy $AGY_FLAGS -p "$(cat "$DIRECTIVE_FILE")" < /dev/null > "$ENGINE_LOG" 2>&1
+    AGY_EXIT=$?
+    ;;
+  pi)
+    pi --no-session --mode text \
+      -p "Follow the attached OpenMontage directive and complete the job non-interactively." \
+      "@${DIRECTIVE_FILE}" < /dev/null > "$ENGINE_LOG" 2>&1
+    AGY_EXIT=$?
+    ;;
+  *)
+    run_codex_exec "$DIRECTIVE_FILE" "$MONTAGE_DIR" "$ENGINE_LOG" "$ENGINE_LOG.err"
+    AGY_EXIT=$?
+    ;;
+esac
 set -e
 
 FINAL_VIDEO="$PROJECT_DIR/output/final.mp4"
@@ -127,7 +171,7 @@ if [[ -f "$HOME/.harness/webhooks/gongshu.env" ]]; then
   curl -s -X POST "$WEBHOOK_URL" \
     -H "Authorization: Bearer $WEBHOOK_KEY" \
     -H "Content-Type: application/json" \
-    -d "{\"ticket\": \"$TICKET_ID\", \"mode\": \"$MODE\", \"category\": \"$CATEGORY\", \"agy_exit\": $AGY_EXIT, \"probe_ok\": $PROBE_OK, \"gdrive_dest\": \"$GDRIVE_DEST\", \"gdrive_link\": \"$GDRIVE_LINK\", \"project_dir\": \"$PROJECT_DIR\"}" >/dev/null 2>&1 || true
+    -d "{\"ticket\": \"$TICKET_ID\", \"mode\": \"$MODE\", \"category\": \"$CATEGORY\", \"agy_exit\": $AGY_EXIT, \"engine\": \"$ENGINE\", \"probe_ok\": $PROBE_OK, \"gdrive_dest\": \"$GDRIVE_DEST\", \"gdrive_link\": \"$GDRIVE_LINK\", \"project_dir\": \"$PROJECT_DIR\"}" >/dev/null 2>&1 || true
 fi
 
-echo "[DONE] ticket=$TICKET_ID mode=$MODE agy_exit=$AGY_EXIT probe_ok=$PROBE_OK gdrive=$GDRIVE_DEST"
+echo "[DONE] ticket=$TICKET_ID mode=$MODE engine=$ENGINE agy_exit=$AGY_EXIT probe_ok=$PROBE_OK gdrive=$GDRIVE_DEST"

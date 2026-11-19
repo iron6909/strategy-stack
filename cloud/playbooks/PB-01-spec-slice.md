@@ -22,7 +22,7 @@
   1. **纵向贯穿**：每个子工单必须切穿真实可运行的一薄层（Schema + 逻辑 + 最小 UI/CLI + 测试）。
   2. **单窗容量**：改动规模必须能在一个全新的本地 `pi` 会话窗口内一次跑通。
   3. **显式阻塞边**：使用 Linear 原生 `Blocked by` 关系连接先后依赖。
-  4. **无需人工审批合入**：子单由本地双绿灯（`pi_exit == 0` + `agy` 审查首行 `VERDICT: PASS`）自动 `--no-ff` 合入 `main` 并推送，没有“Needs Approval 再合入”环节；父 Spec 由 Sirus 做终验，红线动作见 PB-02。
+  4. **无需人工审批合入**：子单由本地双绿灯（实施退出码为 0，回调兼容字段 `pi_exit`；加上独立 `codex exec --sandbox read-only` 审查首行 `VERDICT: PASS`，或显式 `REVIEW_CLI=pi|agy` 回退）自动 `--no-ff` 合入 `main` 并推送，没有“Needs Approval 再合入”环节；父 Spec 由 Sirus 做终验，红线动作见 PB-02。
   5. **MyMontage 零侵入拆单**：凡涉及 MyMontage（OpenMontage 派生仓）的拆单，子工单正文必须写明「开工先读 `custom/AGENTS.md`」，并规定**所有产出文件路径必须以 `custom/` 开头**；根 `AGENTS.md`、`SKILL.md`、`Makefile`、`tools/**` 等上游文件只读。越界改动会被 `run-worker.sh` 的物理门禁（相对捕获 base 与 `upstream/main` 两点完整树比对）判 `custom_gate_violation` 并拒合。
 
 - [ ] **Step 5: 写入五要素标准并激活首波工单 (`Attach 5-Element Criteria & Queue`)**

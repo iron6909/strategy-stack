@@ -5,7 +5,7 @@
 
 ## 合推门禁（唯一标准）
 
-仅当 `pi_exit == 0` **且** `audit_verdict == PASS`（本地 `agy` 纯文本审查首行恰为 `VERDICT: PASS`）时，`local/scripts/run-worker.sh` 才自动 `git merge --no-ff` 合入 base branch 并推送。`auto_merged == 1` 只在 merge 成功、push 成功、且脚本已用 `git fetch` + `merge-base --is-ancestor` 核实远端分支确实包含该 merge commit 之后才会出现；任何一步不成立都写证据、`AUTO_MERGED=0`、保留 worktree。代码工程合入的人工审批已取消；下方红线一条不减。
+仅当实施退出码为 0（回调兼容字段 `pi_exit`）**且** `audit_verdict == PASS`（默认由独立 `codex exec --sandbox read-only --ephemeral` 审查，报告首行恰为 `VERDICT: PASS`）时，`local/scripts/run-worker.sh` 才自动 `git merge --no-ff` 合入 base branch 并推送。`auto_merged == 1` 只在 merge 成功、push 成功、且脚本已用 `git fetch` + `merge-base --is-ancestor` 核实远端分支确实包含该 merge commit 之后才会出现；任何一步不成立都写证据、`AUTO_MERGED=0`、保留 worktree。代码工程合入的人工审批已取消；下方红线一条不减。`WORKER_CLI` / `REVIEW_CLI` 为 `pi` 或 `agy` 时走对应回退，不改变门禁。
 
 ## 标准作业步骤 (Verbatim Todo Steps)
 
@@ -23,14 +23,14 @@
     --prompt-file "/tmp/$TICKET_ID-prompt.md" \
     --base-branch "main" > "/tmp/$TICKET_ID-worker.log" 2>&1 &
   ```
-  脚本既定行为（无需云端介入）：`pi --mode json ... < /dev/null` 实现 → Bash 打包 `.task/review-bundle.txt`（任务书 + `.task/evidence/` 文本证据 + 文件清单 + 绑定已审 commit 的 `git diff`）→ 把完整审查 prompt（硬性禁令 + bundle 全文）写入 `.task/audit-prompt.txt`，再以 `agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m --input-format text < .task/audit-prompt.txt` 从 stdin 读到 EOF 做纯文本审查（prompt 首句硬禁 bash/shell/文件工具，首行必须恰为 `VERDICT: PASS` 或 `VERDICT: FAIL`，报告落 `.task/<工单号>-audit.md`）→ 双绿灯后 `--no-ff` 合推并在推送后核实远端。
-  > **勿把大包放进 argv**：Linux 单个命令行参数上限约 128KiB（`MAX_ARG_STRLEN`）；146KB 的 bundle 塞进 `-p "$(cat ...)"` 会让 `agy` 直接以 `Argument list too long` 退出 126、审查根本没启动。`-p/--print/--prompt` 必须带非空参数，`-p -` 只把字符 `-` 当作 prompt，所以只能用 `--input-format text` + 文件重定向到 EOF 送审。
+  脚本既定行为（无需云端介入）：默认 `codex exec --dangerously-bypass-approvals-and-sandbox --color never -C "$WORK_DIR" --json - < prompt.md` 实现（bypass 只作用于 Codex 自己的审批与沙箱）→ Bash 打包 `.task/review-bundle.txt`（任务书 + `.task/evidence/` 文本证据 + 文件清单 + 绑定已审 commit 的 `git diff`）→ 把完整审查 prompt（硬性禁令 + bundle 全文）写入 `.task/audit-prompt.txt`，再以全新进程 `codex exec --sandbox read-only --ephemeral --color never -C "$WORKTREE_DIR" --output-last-message FILE --json - < .task/audit-prompt.txt` 从 stdin 读到 EOF 做独立只读审查（不挂实现会话，不得带 bypass；prompt 硬禁写目标仓库与用户配置，报告首行必须恰为 `VERDICT: PASS` 或 `VERDICT: FAIL`，报告落 `.task/<工单号>-audit.md`）。父进程对 `.task` 审计路径仍使用 `O_NOFOLLOW` / 非 symlink 门禁，Codex 沙箱不豁免父进程漏洞。→ 双绿灯后 `--no-ff` 合推并在推送后核实远端。
+  > **Prompt 必须从 stdin 读到 EOF，且不可写成双重重定向**：`codex exec ... - < prompt.md < /dev/null` 中后一个重定向会覆盖前者，把任务丢弃。正确形式是单一 `< .task/audit-prompt.txt`（或等价的进程控制 stdin 文件/管道），同时不接受交互。也**勿把大包放进 argv**：Linux 单个命令行参数上限约 128KiB（`MAX_ARG_STRLEN`）。`pi` / `agy` 回退仍遵守各自的 stdin / `@file` 送审约定。
   将 Linear 工单状态更新为 `states.mozi_eng["In Progress"]` 后，**立即结束当前回合休眠**，静待 Webhook 回调唤醒。
 
 - [ ] **Step 3: 接收 Webhook 回调并按 `auto_merged` 分流 (`Process Callback`)**
   被 Webhook 唤醒后，通过 Tailscale 读取 `.task/<工单号>-audit.md`、`.task/<工单号>-merge.txt`、`.task/webhook-payload.json` 与 `evidence_dir`：
-  - **`auto_merged == 1`**：本地已 `--no-ff` 合入 `main` 且推送核实成功（`merge_commit` 已在远端）。在工单评论区贴出交付摘要、`agy` 审查结论、`merge_commit`、`review_bundle` 与 `evidence_dir`，将工单直接推进为 **`Done`**，并在**同一回合**继续 Step 4。
-  - **`auto_merged == 0` 且返工未满 2 次**：把 `audit_reason` / `merge_reason`（如 `verdict_fail`、`empty_report`、`verdict_not_exact_first_line`、`dirty_worktree`、`post_audit_worktree_changed`、`base_changed`、`merge_conflict`、`push_rejected`、`custom_gate_violation`、`custom_gate_upstream_ref_missing`）与审查缺陷追加进提示词，调 `run-worker.sh --resume "$session_file"` 原地返工。若工单实现已在 `feat/<工单号>` 提交、只需重做审查（如 `agy` 因参数超长根本没跑起来），改用 `run-worker.sh --audit-only`：不跑 pi、不 `--resume`、不改实现，复用既有 worktree/tip 重建 bundle 再审查，工作区存在未提交的实现改动时直接判 `dirty_worktree`。
+  - **`auto_merged == 1`**：本地已 `--no-ff` 合入 `main` 且推送核实成功（`merge_commit` 已在远端）。在工单评论区贴出交付摘要、审查结论、`merge_commit`、`review_bundle` 与 `evidence_dir`，将工单直接推进为 **`Done`**，并在**同一回合**继续 Step 4。
+  - **`auto_merged == 0` 且返工未满 2 次**：把 `audit_reason` / `merge_reason`（如 `verdict_fail`、`empty_report`、`verdict_not_exact_first_line`、`dirty_worktree`、`post_audit_worktree_changed`、`base_changed`、`merge_conflict`、`push_rejected`、`custom_gate_violation`、`custom_gate_upstream_ref_missing`）与审查缺陷追加进提示词，调 `run-worker.sh --resume "$session_file"` 原地返工。若工单实现已在 `feat/<工单号>` 提交、只需重做审查（如审查因参数超长或 stdin 被丢弃根本没跑起来），改用 `run-worker.sh --audit-only`：不跑实施引擎、不 `--resume`、不改实现，复用既有 worktree/tip 重建 bundle 再审查，工作区存在未提交的实现改动时直接判 `dirty_worktree`。
   - **回调 JSON 缺少 `auto_merged` 字段**（旧版脚本）：一律视为未合入，**严禁**擅自标 `Done`，按 `audit_verdict` 转人工核验。
   - **连续 2 次同一假设失败**：确认本地工作区已回滚，将工单挂 **`Blocked`**，以 `Blocked` 状态报给 Sirus。
   - 并发锁（`[LOCK_BLOCKED]`）、基线变化、脏仓库、merge 冲突、推送拒绝：`AUTO_MERGED=0`，worktree 与证据保留；脚本从不 `--force` 删除工作树，证据先归档到 `~/task-archive/<工单号>/`。

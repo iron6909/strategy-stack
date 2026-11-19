@@ -142,13 +142,14 @@ new_video_fixture() {
 #!/usr/bin/env bash
 [[ "${1:-}" == "--help" ]] && exit 0
 printf 'env MOZ29_FAKE=%s MOZ29_KEEP=%s\n' "${MOZ29_FAKE_KEY:-unset}" "${MOZ29_KEEP_KEY:-unset}" >> "$AGY_ENV_OUT"
+printf 'proxy NO_PROXY=%s no_proxy=%s\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" >> "$AGY_ENV_OUT"
 AGY
   chmod +x "$VROOT/bin/pgrep" "$VROOT/bin/free" "$VROOT/bin/agy"
   export PATH="$VROOT/bin:$BASE_PATH"
   printf '视频任务书：留一条真证据。\n' > "$VROOT/prompt.md"
   VPROJECT="$VROOT/montage/projects/MOZ-30"
   VEVIDENCE="$VPROJECT/.task/evidence/providers-env.txt"
-  unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY
+  unset MOZ29_FAKE_KEY MOZ29_KEEP_KEY NO_PROXY no_proxy
 }
 run_video() {
   OUT="$(bash "$VIDEO" --montage-dir "$VROOT/montage" --ticket MOZ-30 --category Test \
@@ -209,6 +210,28 @@ eq "agy 看到外层已有值" "$(lines "$AGY_ENV_OUT" "env MOZ29_FAKE=$FAKE_KEY
 eq "证据记录 key:kept" "$(lines "$VEVIDENCE" "key=MOZ29_KEEP_KEY:kept")" "1"
 
 # ---------------------------------------------------------------------------
+# MOZ-36：注入后合并 NO_PROXY / no_proxy，回环地址一定在，已有绕行主机不丢
+CASE="video_no_proxy_loopback_added"
+printf '\n[%s]\n' "$CASE"
+new_video_fixture
+printf 'MOZ29_FAKE_KEY=%s\n' "$FAKE_KEY" > "$HOME/.harness/providers.env"
+run_video
+eq "没有 NO_PROXY 时补上三个回环名（两个大小写变量同值）" \
+  "$(lines "$AGY_ENV_OUT" 'proxy NO_PROXY=127.0.0.1,localhost,::1 no_proxy=127.0.0.1,localhost,::1')" "1"
+
+CASE="video_no_proxy_keeps_existing"
+printf '\n[%s]\n' "$CASE"
+new_video_fixture
+# 文件只设小写变量，外层环境只设大写变量：合并后两个变量都要拿到全部条目
+printf 'no_proxy=.corp.example,10.0.0.0/8\n' > "$HOME/.harness/providers.env"
+export NO_PROXY="api.corp.example"
+run_video
+unset NO_PROXY
+eq "文件与环境的绕行主机都保留，回环追加在后" \
+  "$(lines "$AGY_ENV_OUT" 'proxy NO_PROXY=api.corp.example,.corp.example,10.0.0.0/8,127.0.0.1,localhost,::1 no_proxy=api.corp.example,.corp.example,10.0.0.0/8,127.0.0.1,localhost,::1')" "1"
+eq "证据不记 NO_PROXY 的值" "$(lines "$VEVIDENCE" '.corp.example')" "0"
+
+# ---------------------------------------------------------------------------
 # 静态顺序：注入语句必须出现在 pi/agy 启动行之前
 CASE="static_inject_before_agent"
 printf '\n[%s]\n' "$CASE"
@@ -219,10 +242,14 @@ for pair in "$WORKER|pi --session-dir|agy --disable-slash-commands" \
   inj="$(line_of "$f" 'inject_providers_env "\$')"
   [[ -n "$inj" ]] || { no "$(basename "$f"): 找不到注入调用"; continue; }
   IFS='|' read -r -a agents <<< "$rest"
+  mrg="$(line_of "$f" '^merge_no_proxy_loopback$')"
+  [[ -n "$mrg" ]] || { no "$(basename "$f"): 找不到 NO_PROXY 合并调用"; continue; }
+  is_true "$(basename "$f"): 合并(line $mrg) 晚于注入(line $inj)" '[[ "$mrg" -gt "$inj" ]]'
   for a in "${agents[@]}"; do
     at="$(line_of "$f" "$a")"
     [[ -n "$at" ]] || { no "$(basename "$f"): 找不到启动行 [$a]"; continue; }
     is_true "$(basename "$f"): 注入(line $inj) 早于 [$a](line $at)" '[[ "$inj" -lt "$at" ]]'
+    is_true "$(basename "$f"): 合并(line $mrg) 早于 [$a](line $at)" '[[ "$mrg" -lt "$at" ]]'
   done
 done
 

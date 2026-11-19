@@ -6,6 +6,29 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/providers-env.sh
 . "$SCRIPT_DIR/lib/providers-env.sh"
+. "$SCRIPT_DIR/lib/desktop-env.sh"
+# shellcheck source=lib/review-cli.sh
+. "$SCRIPT_DIR/lib/review-cli.sh"
+
+# 回环绕行兜底（MOZ-36 baseline, integrated here so this branch does not
+# merge the unreviewed feat/MOZ-36 commit). Existing hosts kept; both spellings set.
+merge_no_proxy_loopback() {
+  local merged="" raw entry
+  local -a parts=()
+  local -A seen=()
+  for raw in "${NO_PROXY-}" "${no_proxy-}" '127.0.0.1,localhost,::1'; do
+    [[ -n "$raw" ]] || continue
+    IFS=',' read -r -a parts <<< "$raw"
+    for entry in "${parts[@]}"; do
+      entry="${entry//[[:space:]]/}"
+      [[ -n "$entry" && -z "${seen[$entry]-}" ]] || continue
+      seen[$entry]=1
+      merged="${merged:+$merged,}$entry"
+    done
+  done
+  export NO_PROXY="$merged" no_proxy="$merged"
+}
+
 
 REPO_DIR=""
 TICKET_ID=""
@@ -209,29 +232,39 @@ inject_providers_env "$EVIDENCE_DIR/providers-env.txt" || {
   echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
   exit 5
 }
+merge_no_proxy_loopback
+load_desktop_session_env
 
-# 4. 无头运行 Pi Coding Agent（挂载 OpenCode Go 高配额模型，stdin 必须闭合）
+# 4. 无头运行实施引擎（WORKER_CLI=codex 默认）。Codex 从文件 stdin 读到 EOF，禁止再叠 < /dev/null。
 cd "$WORKTREE_DIR"
+ensure_codex_on_path || true
+WORKER_ENGINE="$(worker_cli_name)"
 SES_FILE=""
 if [[ "$AUDIT_ONLY" -eq 1 ]]; then
-  # 不跑 pi、不 --resume、不改实现：只复用当前 feat/<ticket> tip 重做异构审查
+  # 不跑实施引擎、不 --resume、不改实现：只复用当前 feat/<ticket> tip 重做异构审查
   PI_EXIT=0
 else
   set +e
-  if [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
+  if [[ "$WORKER_ENGINE" == "codex" ]]; then
+    run_codex_exec "$PROMPT_COPY" "$WORKTREE_DIR" "$TASK_DIR/$TICKET_ID.jsonl" "$TASK_DIR/$TICKET_ID.jsonl.err"
+    PI_EXIT=$?
+  elif [[ -n "$RESUME_SESSION" && -f "$RESUME_SESSION" ]]; then
     pi --session-dir "$TASK_DIR/sessions" --session "$RESUME_SESSION" --mode json \
        -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+    PI_EXIT=$?
   else
     pi --session-dir "$TASK_DIR/sessions" --mode json \
        -p "$(cat "$PROMPT_COPY")" > "$TASK_DIR/$TICKET_ID.jsonl" 2>&1 < /dev/null
+    PI_EXIT=$?
   fi
-  PI_EXIT=$?
   set -e
   SES_FILE=$(ls -t "$TASK_DIR/sessions/"*.jsonl 2>/dev/null | head -n 1 || echo "")
 fi
 AUDIT_VERDICT="SKIPPED"
 AUDIT_REASON="pi_failed"
 AGY_EXIT=""
+REVIEW_EXIT=""
+REVIEW_ENGINE=""
 AUDITED_COMMIT=""
 AUDITED_BASE=""
 CUSTOM_GATE_ENABLED=0
@@ -575,7 +608,7 @@ archive_evidence() {
 }
 
 # ---------------------------------------------------------------------------
-# 5. 纯文本异构审查（Gemini Pro agy 读 stdin，只读、无工具、首行硬判定）
+# 5. 纯文本异构审查（REVIEW_CLI=pi 默认：bwrap 禁写 + --no-tools + @file；agy 可回退）
 # ---------------------------------------------------------------------------
 if [[ "$PI_EXIT" -eq 0 ]]; then
   git -C "$WORKTREE_DIR" fetch origin "$BASE_BRANCH" >/dev/null 2>&1 || true
@@ -604,8 +637,13 @@ if [[ "$PI_EXIT" -eq 0 ]]; then
   elif [[ "$COMMITS_AHEAD" -lt 1 ]] && ! git -C "$WORKTREE_DIR" merge-base --is-ancestor "$AUDITED_COMMIT" "$AUDITED_BASE"; then
     # 例外：本分支已合入 base（重复执行），此时 commits_ahead=0 属正常幂等
     AUDIT_VERDICT="FAIL"; AUDIT_REASON="no_commits_ahead_of_base"
-  elif ! command -v agy >/dev/null 2>&1; then
-    AUDIT_VERDICT="FAIL"; AUDIT_REASON="agy_missing"
+  else
+    REVIEW_ENGINE="$(review_cli_name)"
+    if [[ "$REVIEW_ENGINE" == "codex" ]]; then
+      ensure_codex_on_path || true
+    fi
+    if ! command -v "$REVIEW_ENGINE" >/dev/null 2>&1; then
+    AUDIT_VERDICT="FAIL"; AUDIT_REASON="${REVIEW_ENGINE}_missing"
   else
     build_review_bundle
     # 审查 prompt 全文落盘后从 stdin 送审：Linux 单参数上限约 128KiB（MAX_ARG_STRLEN），
@@ -634,20 +672,44 @@ AUDIT_PROMPT_HEAD
 
     if [[ "$CUSTOM_GATE_BLOCKED" -eq 0 ]]; then
       set +e
-      # SSH 会话下 agy 会改走文件凭证并表现为未登录：子进程摘掉 SSH_* 复用本机已登录 keyring。
-      # 只摘环境变量，不读取/拷贝/打印任何 token 或凭据文件，不改平台安全控制。
-      env -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY -u SSH_AUTH_SOCK \
-        agy --disable-slash-commands --dangerously-skip-permissions --print-timeout 15m \
-        --input-format text < "$AUDIT_PROMPT_FILE" > "$AUDIT_FILE" 2>&1
-      AGY_EXIT=$?
+      case "$REVIEW_ENGINE" in
+        agy)
+          # SSH 会话下 agy 会改走文件凭证并表现为未登录：子进程摘掉 SSH_* 复用本机已登录 keyring。
+          run_agy_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE"
+          REVIEW_EXIT=$?
+          AGY_EXIT="$REVIEW_EXIT"
+          ;;
+        pi)
+          run_pi_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE.raw" "$TASK_DIR" "$AUDIT_FILE.err"
+          REVIEW_EXIT=$?
+          ;;
+        *)
+          # Codex 内核/原生 --sandbox read-only；不使用 bypass；prompt 从 stdin 读到 EOF。
+          run_codex_review "$AUDIT_PROMPT_FILE" "$AUDIT_FILE" "$WORKTREE_DIR" "$TASK_DIR" "$AUDIT_FILE.err"
+          REVIEW_EXIT=$?
+          ;;
+      esac
       set -e
+      if [[ "$REVIEW_ENGINE" == "pi" && "$REVIEW_EXIT" -eq 90 ]]; then
+        printf 'VERDICT: FAIL\n[Act On] review sandbox (bwrap) is required and was not available.\n' > "$AUDIT_FILE"
+        AUDIT_VERDICT="FAIL"
+        AUDIT_REASON="review_sandbox_missing_bwrap"
+      elif [[ "$REVIEW_ENGINE" == "pi" ]]; then
+        extract_review_text "$AUDIT_FILE.raw" "$AUDIT_FILE" >/dev/null
+      fi
     fi
 
     AUDIT_FIRST="$(sed -n '1p' "$AUDIT_FILE" 2>/dev/null | tr -d '\r' | sed -e 's/[[:space:]]*$//')"
     if [[ "$CUSTOM_GATE_BLOCKED" -eq 1 ]]; then
       : # write_custom_gate_fail 已写入首行 VERDICT: FAIL 与越界路径
-    elif [[ "$AGY_EXIT" -ne 0 ]]; then
-      AUDIT_VERDICT="FAIL"; AUDIT_REASON="agy_exit_$AGY_EXIT"
+    elif [[ "${AUDIT_REASON:-}" == "review_sandbox_missing_bwrap" ]]; then
+      :
+    elif [[ -n "${REVIEW_EXIT}" && "$REVIEW_EXIT" -ne 0 ]]; then
+      if [[ "$REVIEW_ENGINE" == "agy" ]]; then
+        AUDIT_VERDICT="FAIL"; AUDIT_REASON="agy_exit_$REVIEW_EXIT"
+      else
+        AUDIT_VERDICT="FAIL"; AUDIT_REASON="review_exit_$REVIEW_EXIT"
+      fi
     elif [[ ! -s "$AUDIT_FILE" ]]; then
       AUDIT_VERDICT="FAIL"; AUDIT_REASON="empty_report"
     elif [[ "$AUDIT_FIRST" == "VERDICT: PASS" ]]; then
@@ -665,6 +727,7 @@ AUDIT_PROMPT_HEAD
       elif [[ "$(worktree_state)" != "$STATE_AT_AUDIT" ]]; then
         AUDIT_VERDICT="FAIL"; AUDIT_REASON="post_audit_worktree_changed"
       fi
+    fi
     fi
   fi
 fi
@@ -686,6 +749,9 @@ cat > "$PAYLOAD_FILE" <<JSON
   "pi_exit": $PI_EXIT,
   "audit_verdict": "$(json_escape "$AUDIT_VERDICT")",
   "audit_reason": "$(json_escape "$AUDIT_REASON")",
+  "review_cli": "$(json_escape "${REVIEW_ENGINE:-}")",
+  "engine": "$(json_escape "${REVIEW_ENGINE:-}")",
+  "review_exit": ${REVIEW_EXIT:-null},
   "auto_merged": $AUTO_MERGED,
   "merge_commit": "$(json_escape "${MERGE_COMMIT:-}")",
   "merge_reason": "$(json_escape "$MERGE_REASON")",
@@ -712,4 +778,4 @@ if [[ -f "$HOME/.harness/webhooks/mozi.env" ]]; then
 fi
 
 # worktree 永不自动删除：失败保留现场，清理由 PB-04 人工执行且禁止 --force
-echo "[DONE] ticket=$TICKET_ID pi_exit=$PI_EXIT audit=$AUDIT_VERDICT audit_reason=$AUDIT_REASON auto_merged=$AUTO_MERGED merge_commit=${MERGE_COMMIT:-NONE} merge_reason=$MERGE_REASON session=$SES_FILE"
+echo "[DONE] ticket=$TICKET_ID pi_exit=$PI_EXIT audit=$AUDIT_VERDICT audit_reason=$AUDIT_REASON engine=${REVIEW_ENGINE:-none} review_exit=${REVIEW_EXIT:-} auto_merged=$AUTO_MERGED merge_commit=${MERGE_COMMIT:-NONE} merge_reason=$MERGE_REASON session=$SES_FILE"
