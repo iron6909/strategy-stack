@@ -138,7 +138,13 @@ run_pi_review() {
   } 2>/dev/null || true
 
   set +e
-  review_sandbox_run --write "$allowed_dir" -- \
+  # ~/.pi must stay writable for pi lock files even with --no-session.
+  # The worktree / allowed review dir policy is unchanged: only listed binds are writable.
+  local -a sandbox_writes=(--write "$allowed_dir")
+  if [[ -n "${HOME:-}" && -d "$HOME/.pi" ]]; then
+    sandbox_writes+=(--write "$HOME/.pi")
+  fi
+  review_sandbox_run "${sandbox_writes[@]}" -- \
     "$pi_bin" --no-session --no-tools --no-mcp --no-extensions --no-skills \
     --no-context-files --no-prompt-templates --mode json \
     -p "$instruction" "@${prompt_file}" < /dev/null > "$out_file" 2>"$err_file"
