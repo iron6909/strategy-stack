@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/providers-env.sh
+. "$SCRIPT_DIR/lib/providers-env.sh"
+
 MONTAGE_DIR=""
 TICKET_ID=""
 CATEGORY="01_English_Drama"
@@ -40,6 +44,13 @@ fi
 PROJECT_DIR="$MONTAGE_DIR/projects/$TICKET_ID"
 mkdir -p "$PROJECT_DIR/output" "$PROJECT_DIR/tmp" "$PROJECT_DIR/.task/evidence"
 cp "$PROMPT_FILE" "$PROJECT_DIR/.task/$TICKET_ID-brief.md"
+
+# 2.5 受信本地凭据注入：只在 $HOME/.harness/providers.env 存在时 source，缺失即跳过。
+# 必须在 agy 启动之前完成；source 失败一律硬失败，绝不 || true。
+inject_providers_env "$PROJECT_DIR/.task/evidence/providers-env.txt" || {
+  echo "[FAIL] 注入 $HOME/.harness/providers.env 失败（source 返回 $?）"
+  exit 5
+}
 
 # 3. 启动 agy 全权操纵 OpenMontage 五层流水线（免批模式 + 闭合 Stdin 防止后台挂起）
 cd "$MONTAGE_DIR"
