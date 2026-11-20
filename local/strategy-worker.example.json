@@ -1,0 +1,51 @@
+{
+  "state_dir": "/var/lib/strategy-worker",
+  "slots": 2,
+  "operators": ["operator"],
+  "webhook_url": "https://example.invalid/webhook",
+  "engines": {
+    "pi": {
+      "enabled": false,
+      "implementation_launcher": ["/opt/strategy/bin/implementation-sandbox"],
+      "review_launcher": ["/opt/strategy/bin/review-sandbox"],
+      "models": {
+        "deepseek-v4.1-flash": {"cli_model": "opencode-go/deepseek-v4.1-flash", "vendor": "deepseek"},
+        "muse-1.3": {"enabled": false}
+      }
+    },
+    "agy": {
+      "enabled": false,
+      "isolated_review": false,
+      "implementation_launcher": ["/opt/strategy/bin/implementation-sandbox"],
+      "review_launcher": ["/opt/strategy/bin/review-sandbox"],
+      "models": {
+        "Hydrogen": {"cli_model": "Hydrogen"},
+        "Carbon": {"cli_model": "Carbon"},
+        "Neon": {"cli_model": "Neon"}
+      }
+    },
+    "codex": {
+      "enabled": false,
+      "implementation_launcher": ["/opt/strategy/bin/implementation-sandbox"],
+      "review_launcher": ["/opt/strategy/bin/review-sandbox"],
+      "models": {
+        "terra": {"cli_model": "terra"},
+        "sol": {"cli_model": "sol"}
+      }
+    }
+  },
+  "projects": {
+    "mymontage": {
+      "repo": "/srv/MyMontage",
+      "github_repo": "OWNER/MyMontage",
+      "base": "main",
+      "auto_merge": false,
+      "verify_launcher": ["/opt/strategy/bin/verification-sandbox"],
+      "verify": ["/srv/MyMontage/.venv/bin/python", "-B", "/srv/MyMontage/custom/strategy/verify.py"],
+      "policy_path": "custom/strategy/policy.json",
+      "production_launcher": ["/opt/strategy/bin/production-sandbox"],
+      "production_environment": ["MYMONTAGE_GDRIVE_REMOTE"],
+      "production": ["/srv/MyMontage/.venv/bin/python", "-B", "custom/strategy/production.py"]
+    }
+  }
+}

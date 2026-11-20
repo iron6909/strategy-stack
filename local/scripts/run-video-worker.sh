@@ -51,9 +51,6 @@ if [[ -z "$MONTAGE_DIR" || -z "$TICKET_ID" || -z "$PROMPT_FILE" ]]; then
   exit 1
 fi
 
-# 0. 无感拉取最新 strategy-stack 规则
-git -C "$HOME/strategy-stack" pull --ff-only >/dev/null 2>&1 || true
-
 # 1. 24G 内存与 2 并发硬门禁检查
 # 锚定完整命令词（MOZ-9）：避免 brave/grok/pipewire/acpi/napi 等含 "pi" 的无关进程被计入
 ACTIVE_JOBS=$(pgrep -fc '(^|/)(pi|agy|ffmpeg|remotion)( |$)' || true)

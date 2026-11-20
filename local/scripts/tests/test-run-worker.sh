@@ -7,6 +7,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/../run-worker.sh"
 TICKET="MOZ-11"
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/rw-tests.XXXXXX")"
+export TMPDIR="$TMPROOT"
 if [[ "${KEEP_TMP:-0}" == "1" ]]; then
   trap 'printf "\n[kept] 临时仓库与临时 remote 保留在 %s\n" "$TMPROOT"' EXIT
 else

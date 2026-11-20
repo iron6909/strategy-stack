@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "enum": [
+        "code",
+        "production"
+      ]
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "ticket": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000,
+      "pattern": "\\S"
+    },
+    "done_check": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000,
+      "pattern": "\\S"
+    },
+    "proof": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000,
+      "pattern": "\\S"
+    },
+    "known_info": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000,
+      "pattern": "\\S"
+    },
+    "constraints": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16000,
+      "pattern": "\\S"
+    },
+    "engine": {
+      "enum": [
+        "pi",
+        "codex",
+        "agy"
+      ]
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "\\S"
+    },
+    "options": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "ticket",
+    "project",
+    "attempt",
+    "goal",
+    "done_check",
+    "proof",
+    "known_info",
+    "constraints"
+  ],
+  "additionalProperties": false,
+  "dependentRequired": {
+    "model": [
+      "engine"
+    ]
+  }
+}

@@ -16,6 +16,7 @@
   加载 `~/strategy-stack/cloud/skills/unslop-cn.md`：
   - 起草 1–2 条联动工部进展或日常心得的中文原创短推（默认严格 **1–12 个字符**，仅含硬核指标对比时放宽至不超过 35 字的 1–2 句短句）。
   - 针对筛选出的大 V 帖子，按【捧场 / 学习 / 借鉴 / 认同 / 补充】五种姿势起草 2–3 条评论草稿（默认严格 **1–12 个字符**）。
+- 提交前用 `local/scripts/dispatch-worker.sh draft-check -- '<草稿>'` 检查长度和禁语。原创短推有硬核实测指标时显式加 `--measured`，评论仍用默认上限。手动核对来源链接和事实归因。
 
 - [ ] **Step 4: 写入 Linear 行人司并挂起审批 (`Publish Draft to Linear & Pause`)**
   使用 `teams.zhangyi_social.team_id`、`labels["type:x-draft"]` 与状态 `states.zhangyi_social["Needs Approval"]` 在 Linear 行人司创建草稿工单交 Sirus 审批。

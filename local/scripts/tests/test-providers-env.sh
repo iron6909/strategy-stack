@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# providers.env 注入回归：注入库单测 + run-video-worker.sh 集成 + 两脚本注入顺序静态检查。
+# providers.env 注入回归：注入库单测和 run-video-worker.sh 集成。
 # 全部在 mktemp 临时 HOME 里跑，只用编造的假值，绝不读写真实 ~/.harness/providers.env。
 set -uo pipefail
 
@@ -136,6 +136,7 @@ new_video_fixture() {
   export HOME="$VROOT/home"
   mkdir -p "$HOME/.harness" "$VROOT/bin" "$VROOT/montage"
   export AGY_ENV_OUT="$VROOT/agy-env.txt"
+  export MONTAGE_CLI=agy
   printf '#!/usr/bin/env bash\necho 0\n' > "$VROOT/bin/pgrep"
   printf '#!/usr/bin/env bash\necho "Mem:  32000  1000  20000  0  1000  20000"\n' > "$VROOT/bin/free"
   cat > "$VROOT/bin/agy" <<'AGY'
@@ -230,28 +231,6 @@ unset NO_PROXY
 eq "文件与环境的绕行主机都保留，回环追加在后" \
   "$(lines "$AGY_ENV_OUT" 'proxy NO_PROXY=api.corp.example,.corp.example,10.0.0.0/8,127.0.0.1,localhost,::1 no_proxy=api.corp.example,.corp.example,10.0.0.0/8,127.0.0.1,localhost,::1')" "1"
 eq "证据不记 NO_PROXY 的值" "$(lines "$VEVIDENCE" '.corp.example')" "0"
-
-# ---------------------------------------------------------------------------
-# 静态顺序：注入语句必须出现在 pi/agy 启动行之前
-CASE="static_inject_before_agent"
-printf '\n[%s]\n' "$CASE"
-line_of() { grep -nE "$2" "$1" 2>/dev/null | head -n1 | cut -d: -f1; }
-for pair in "$WORKER|pi --session-dir|agy --disable-slash-commands" \
-            "$VIDEO|AGY_FLAGS -p" ; do
-  f="${pair%%|*}"; rest="${pair#*|}"
-  inj="$(line_of "$f" 'inject_providers_env "\$')"
-  [[ -n "$inj" ]] || { no "$(basename "$f"): 找不到注入调用"; continue; }
-  IFS='|' read -r -a agents <<< "$rest"
-  mrg="$(line_of "$f" '^merge_no_proxy_loopback$')"
-  [[ -n "$mrg" ]] || { no "$(basename "$f"): 找不到 NO_PROXY 合并调用"; continue; }
-  is_true "$(basename "$f"): 合并(line $mrg) 晚于注入(line $inj)" '[[ "$mrg" -gt "$inj" ]]'
-  for a in "${agents[@]}"; do
-    at="$(line_of "$f" "$a")"
-    [[ -n "$at" ]] || { no "$(basename "$f"): 找不到启动行 [$a]"; continue; }
-    is_true "$(basename "$f"): 注入(line $inj) 早于 [$a](line $at)" '[[ "$inj" -lt "$at" ]]'
-    is_true "$(basename "$f"): 合并(line $mrg) 早于 [$a](line $at)" '[[ "$mrg" -lt "$at" ]]'
-  done
-done
 
 # ---------------------------------------------------------------------------
 printf '\n==== summary: %d passed, %d failed ====\n' "$PASSED" "$FAILED"

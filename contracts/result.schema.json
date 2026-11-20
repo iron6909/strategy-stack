@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "enum": [
+        "code",
+        "production"
+      ]
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "ticket": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "project": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "status": {
+      "enum": [
+        "accepted",
+        "implementing",
+        "implemented",
+        "pr_open",
+        "awaiting_review",
+        "reviewed",
+        "merge_wait",
+        "merged",
+        "producing",
+        "awaiting_approval",
+        "produced",
+        "paused",
+        "retryable",
+        "blocked"
+      ]
+    },
+    "pr_number": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "pr_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "merge_sha": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "output": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "pattern": "\\S"
+        },
+        "verification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "pattern": "\\S"
+        },
+        "archive": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "pattern": "\\S"
+        }
+      },
+      "required": [
+        "artifact",
+        "verification",
+        "archive"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "ticket",
+    "project",
+    "attempt",
+    "event_id",
+    "revision",
+    "status"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "merged"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "code"
+          }
+        },
+        "required": [
+          "pr_number",
+          "pr_url",
+          "head_sha",
+          "base_sha",
+          "merge_sha",
+          "review"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "produced"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "kind": {
+            "const": "production"
+          }
+        },
+        "required": [
+          "output"
+        ]
+      }
+    }
+  ]
+}
